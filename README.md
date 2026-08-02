@@ -11,7 +11,7 @@
   - 优雅关闭虚拟机（超时自动强制关闭）
   - 启动虚拟机
 - 双击图标打开 ExHyperV
-- 每 5 秒轮询一次状态，内存约 10MB，无网络/磁盘开销
+- 基于 WMI 事件订阅实时响应，空闲时零轮询、零 CPU 开销；另有 60 秒兜底刷新防止漏报
 
 ## 依赖
 
@@ -25,7 +25,7 @@
 
 ## 原理
 
-通过 WMI（`root\virtualization\v2`）查询 `Msvm_ComputerSystem`，以 GUID 过滤虚拟机并读取 `EnabledState` 判断运行状态；`Msvm_ShutdownComponent.InitiateShutdown` 实现优雅关机，`Msvm_ComputerSystem.RequestStateChange` 实现启动与强制关闭。
+使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现。
 
 ## 构建
 

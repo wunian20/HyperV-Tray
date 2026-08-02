@@ -38,6 +38,9 @@ namespace HyperVTray
 
         private static NotifyIcon tray;
         private static System.Windows.Forms.Timer timer;
+        private static SynchronizationContext sync;
+        private static readonly object gate = new object();
+        private static long lastHandleTicks;
         private static string lastSig = "";
 
         [STAThread]
@@ -46,6 +49,9 @@ namespace HyperVTray
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            sync = new WindowsFormsSynchronizationContext();
+            SynchronizationContext.SetSynchronizationContext(sync);
+
             tray = new NotifyIcon();
             tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             tray.Text = "Hyper-V 监控";
@@ -53,9 +59,12 @@ namespace HyperVTray
             tray.DoubleClick += (s, e) => OpenExHyperV();
             tray.ContextMenuStrip = new ContextMenuStrip();
 
-            timer = new System.Windows.Forms.Timer { Interval = 5000 };
+            timer = new System.Windows.Forms.Timer { Interval = 60000 };
             timer.Tick += (s, e) => UpdateStatus();
             timer.Start();
+
+            var watch = new Thread(WatchLoop) { IsBackground = true };
+            watch.Start();
 
             UpdateStatus();
             Application.Run();
@@ -219,6 +228,50 @@ namespace HyperVTray
         {
             var t = new System.Threading.Thread(action) { IsBackground = true };
             t.Start();
+        }
+
+        private static void WatchLoop()
+        {
+            while (true)
+            {
+                try
+                {
+                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                    scope.Connect();
+                    string filter = "TargetInstance ISA 'Msvm_ComputerSystem'";
+                    EventArrivedEventHandler handler = (s, e) => RaiseUpdate();
+
+                    var mod = new ManagementEventWatcher(scope, new WqlEventQuery("SELECT * FROM __InstanceModificationEvent WITHIN 1 WHERE " + filter));
+                    var cre = new ManagementEventWatcher(scope, new WqlEventQuery("SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE " + filter));
+                    var del = new ManagementEventWatcher(scope, new WqlEventQuery("SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE " + filter));
+
+                    mod.EventArrived += handler;
+                    cre.EventArrived += handler;
+                    del.EventArrived += handler;
+
+                    mod.Start();
+                    cre.Start();
+                    del.Start();
+
+                    Thread.Sleep(Timeout.Infinite);
+                }
+                catch
+                {
+                    Thread.Sleep(10000);
+                }
+            }
+        }
+
+        private static void RaiseUpdate()
+        {
+            lock (gate)
+            {
+                long now = DateTime.UtcNow.Ticks;
+                if (now - lastHandleTicks < TimeSpan.TicksPerSecond * 2) return;
+                lastHandleTicks = now;
+            }
+            try { sync.Post(delegate { UpdateStatus(); }, null); }
+            catch { }
         }
 
         private static ManagementObject GetVmObject(ManagementScope scope, string guid)
