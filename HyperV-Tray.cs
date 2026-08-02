@@ -38,9 +38,8 @@ namespace HyperVTray
 
         private static NotifyIcon tray;
         private static System.Windows.Forms.Timer timer;
+        private static System.Threading.Timer debounce;
         private static SynchronizationContext sync;
-        private static readonly object gate = new object();
-        private static long lastHandleTicks;
         private static string lastSig = "";
 
         [STAThread]
@@ -62,6 +61,8 @@ namespace HyperVTray
             timer = new System.Windows.Forms.Timer { Interval = 60000 };
             timer.Tick += (s, e) => UpdateStatus();
             timer.Start();
+
+            debounce = new System.Threading.Timer(delegate { PostUpdate(); }, null, Timeout.Infinite, Timeout.Infinite);
 
             var watch = new Thread(WatchLoop) { IsBackground = true };
             watch.Start();
@@ -262,15 +263,15 @@ namespace HyperVTray
             }
         }
 
+        private static void PostUpdate()
+        {
+            try { sync.Post(delegate { UpdateStatus(); }, null); }
+            catch { }
+        }
+
         private static void RaiseUpdate()
         {
-            lock (gate)
-            {
-                long now = DateTime.UtcNow.Ticks;
-                if (now - lastHandleTicks < TimeSpan.TicksPerSecond * 2) return;
-                lastHandleTicks = now;
-            }
-            try { sync.Post(delegate { UpdateStatus(); }, null); }
+            try { debounce.Change(800, Timeout.Infinite); }
             catch { }
         }
 
