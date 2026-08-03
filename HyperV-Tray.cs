@@ -74,6 +74,7 @@ namespace HyperVTray
         private static NotifyIcon tray;
         private static Icon baseIcon;
         private static Icon greenIcon;
+        private static Icon redIcon;
         private static FormsTimer refresh;
         private static ThreadingTimer debounce;
         private static SynchronizationContext sync;
@@ -108,12 +109,15 @@ namespace HyperVTray
             tray.ContextMenuStrip = new ContextMenuStrip();
             tray.ContextMenuStrip.Renderer = new StatusRenderer();
             tray.ContextMenuStrip.Opening += (s, e) => RefreshMenu();
+            tray.ContextMenuStrip.Opened += (s, e) => AdjustMenuBounds();
             tray.ContextMenuStrip.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
 
             try
             {
                 using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Green"))
                     if (s != null) greenIcon = new Icon(s);
+                using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Red"))
+                    if (s != null) redIcon = new Icon(s);
             }
             catch { }
 
@@ -139,7 +143,8 @@ namespace HyperVTray
             foreach (var v in vms)
                 if (v.Running) running.Add(v);
 
-            tray.Icon = (running.Count > 0 && greenIcon != null) ? greenIcon : baseIcon;
+            if (!IsHyperVServiceRunning()) tray.Icon = redIcon != null ? redIcon : baseIcon;
+            else tray.Icon = (running.Count > 0 && greenIcon != null) ? greenIcon : baseIcon;
             tray.Visible = true;
             if (running.Count > 0)
             {
@@ -164,6 +169,22 @@ namespace HyperVTray
             foreach (var v in vms)
                 if (v.Running) { hasRunning = true; break; }
             uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
+        }
+
+        private static void AdjustMenuBounds()
+        {
+            try
+            {
+                var menu = tray.ContextMenuStrip;
+                var wa = Screen.FromPoint(menu.Location).WorkingArea;
+                int x = menu.Left, y = menu.Top;
+                if (menu.Right > wa.Right) x = wa.Right - menu.Width;
+                if (menu.Bottom > wa.Bottom) y = wa.Bottom - menu.Height;
+                if (x < wa.Left) x = wa.Left;
+                if (y < wa.Top) y = wa.Top;
+                if (x != menu.Left || y != menu.Top) menu.Location = new Point(x, y);
+            }
+            catch { }
         }
 
         private static void TickUptime()
@@ -234,7 +255,7 @@ namespace HyperVTray
 
         private static void ShowBalloon(string name, string action)
         {
-            try { tray.ShowBalloonTip(2500, "Hyper-V", name + " " + action, ToolTipIcon.Info); }
+            try { tray.ShowBalloonTip(2500, "Hyper-V", name + " " + action, ToolTipIcon.None); }
             catch { }
         }
 
@@ -301,7 +322,7 @@ namespace HyperVTray
                 v.CpuLoad = QueryCpu(scope, v.Guid);
                 v.MemoryUsedMB = QueryUsedMem(scope, v.Guid);
 
-                var memQuery = new ObjectQuery("SELECT VirtualQuantity, Limit, DynamicMemoryEnabled FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
+                var memQuery = new ObjectQuery("SELECT Limit, DynamicMemoryEnabled FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
                 using (var s = new ManagementObjectSearcher(scope, memQuery))
                 {
                     foreach (ManagementObject mo in s.Get())
@@ -716,7 +737,7 @@ namespace HyperVTray
                     var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                     scope.Connect();
                     var list = new List<string>();
-                    var q = new ObjectQuery("SELECT Name, ElementName, EnabledState FROM Msvm_ComputerSystem");
+                    var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
                     using (var s = new ManagementObjectSearcher(scope, q))
                     {
                         foreach (ManagementObject mo in s.Get())

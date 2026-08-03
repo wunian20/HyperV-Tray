@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 托盘图标常驻，按状态变色：有虚拟机运行显示**绿色**，全部关闭显示**蓝色**
+- 托盘图标常驻，按状态变色：Hyper-V 服务未启用显示**红色**，有虚拟机运行显示**绿色**，全部关闭显示**蓝色**
 - 悬停可查看正在运行的虚拟机及全部关闭状态
 - 右键菜单列出所有虚拟机，实时显示运行中虚拟机的 CPU、已使用/分配（动态内存显示"最大"）内存、运行时长，每秒自动刷新
 - 每台虚拟机支持：
@@ -12,7 +12,7 @@
   - 启动 / 优雅关闭虚拟机（超时自动强制关闭）
 - 关闭全部虚拟机（带确认弹窗）
 - 连接所有运行中的虚拟机
-- 虚拟机启动/关闭时弹出系统默认气泡通知
+- 虚拟机启动/关闭时弹出文字气泡通知（无附加图标）
 - 打开 ExHyperV 管理界面（存在时联动）；不存在时自动回退到系统 Hyper-V 管理器
 - 支持开机自启（菜单开关，写入启动文件夹快捷方式）
 - 单实例保护（全局 Mutex）
@@ -37,7 +37,7 @@
 需要 .NET Framework 4.x（Windows 自带）：
 
 ```powershell
-csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /resource:green.ico,HyperVTray.Green /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll HyperV-Tray.cs
+csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /resource:green.ico,HyperVTray.Green /resource:red.ico,HyperVTray.Red /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /r:System.ServiceProcess.dll HyperV-Tray.cs
 ```
 
 ## 文件
@@ -46,3 +46,4 @@ csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /reso
 - `HyperV-Tray.exe` — 编译产物
 - `HyperV-Tray.ico` — 应用图标（蓝色版）
 - `green.ico` — 运行状态图标（绿色版，编译时嵌入）
+- `red.ico` — 服务未启用图标（红色版，编译时嵌入）
