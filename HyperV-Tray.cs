@@ -375,9 +375,22 @@ namespace HyperVTray
                         lock (uptimeEntries) uptimeEntries.Add(entry);
                     }
 
-                    var open = new ToolStripMenuItem("打开 ExHyperV 界面");
-                    open.Click += (s, e) => OpenExHyperV();
-                    vmItem.DropDownItems.Add(open);
+                    if (HasExHyperV())
+                    {
+                        var open = new ToolStripMenuItem("打开 ExHyperV 界面");
+                        open.Click += (s, e) => OpenExHyperV();
+                        vmItem.DropDownItems.Add(open);
+                    }
+                    else
+                    {
+                        var open = new ToolStripMenuItem("打开 Hyper-V 管理器");
+                        open.Click += (s, e) => OpenHyperVManager();
+                        vmItem.DropDownItems.Add(open);
+
+                        var connect = new ToolStripMenuItem("连接虚拟机");
+                        connect.Click += (s, e) => ConnectVm(vmName);
+                        vmItem.DropDownItems.Add(connect);
+                    }
 
                     if (v.Running)
                     {
@@ -432,6 +445,12 @@ namespace HyperVTray
             menu.Items.Add(exit);
         }
 
+        private static bool HasExHyperV()
+        {
+            try { return File.Exists(ExHyperVPath) || Process.GetProcessesByName("ExHyperV").Length > 0; }
+            catch { return false; }
+        }
+
         private static void OpenExHyperV()
         {
             try
@@ -446,10 +465,31 @@ namespace HyperVTray
                         SetForegroundWindow(h);
                     }
                 }
-                else
+                else if (File.Exists(ExHyperVPath))
                 {
                     Process.Start(ExHyperVPath);
                 }
+                else
+                {
+                    OpenHyperVManager();
+                }
+            }
+            catch { OpenHyperVManager(); }
+        }
+
+        private static void OpenHyperVManager()
+        {
+            try { Process.Start("virtmgmt.msc"); }
+            catch { }
+        }
+
+        private static void ConnectVm(string name)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("vmconnect.exe", "localhost \"" + name + "\"");
+                psi.UseShellExecute = false;
+                Process.Start(psi);
             }
             catch { }
         }
