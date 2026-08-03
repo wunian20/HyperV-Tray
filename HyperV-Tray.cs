@@ -27,6 +27,7 @@ namespace HyperVTray
     {
         public string Name;
         public string Guid;
+        public int StateCode;
         public bool Running;
         public long UpTimeSeconds;
         public int CpuLoad = -1;
@@ -74,6 +75,7 @@ namespace HyperVTray
         private static NotifyIcon tray;
         private static Icon baseIcon;
         private static Icon greenIcon;
+        private static Icon yellowIcon;
         private static Icon redIcon;
         private static FormsTimer refresh;
         private static ThreadingTimer debounce;
@@ -82,7 +84,8 @@ namespace HyperVTray
         private static ThreadingTimer uptimeTick;
         private static readonly List<UptimeEntry> uptimeEntries = new List<UptimeEntry>();
         private static DateTime menuOpenTime;
-        private static readonly Dictionary<string, bool> prevRun = new Dictionary<string, bool>();
+        private static readonly Dictionary<string, int> prevRun = new Dictionary<string, int>();
+        private static bool suppressNotify;
         private static string exHyperVPath;
         private static DateTime exScanTime;
         private static bool firstSync = true;
@@ -125,6 +128,8 @@ namespace HyperVTray
             {
                 using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Green"))
                     if (s != null) greenIcon = new Icon(s);
+                using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Yellow"))
+                    if (s != null) yellowIcon = new Icon(s);
                 using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Red"))
                     if (s != null) redIcon = new Icon(s);
             }
@@ -177,11 +182,17 @@ namespace HyperVTray
             List<VMInfo> vms = GetVms();
 
             var running = new List<VMInfo>();
+            bool anySaved = false;
             foreach (var v in vms)
+            {
                 if (v.Running) running.Add(v);
+                if (v.StateCode == 6) anySaved = true;
+            }
 
             if (!IsHyperVServiceRunning()) tray.Icon = redIcon != null ? redIcon : baseIcon;
-            else tray.Icon = (running.Count > 0 && greenIcon != null) ? greenIcon : baseIcon;
+            else if (running.Count > 0 && greenIcon != null) tray.Icon = greenIcon;
+            else if (anySaved && yellowIcon != null) tray.Icon = yellowIcon;
+            else tray.Icon = baseIcon;
             tray.Visible = true;
             if (running.Count > 0)
             {
@@ -272,20 +283,21 @@ namespace HyperVTray
                 {
                     firstSync = false;
                 }
-                else
+                else if (!suppressNotify)
                 {
                     foreach (var v in vms)
                     {
-                        bool prev;
+                        int prev;
                         if (!prevRun.TryGetValue(v.Guid, out prev)) continue;
-                        if (v.Running && !prev) ShowBalloon(v.Name, "已启动");
-                        else if (!v.Running && prev) ShowBalloon(v.Name, "已关闭");
+                        if (v.StateCode == 2 && prev != 2) ShowBalloon(v.Name, "已启动");
+                        else if (v.StateCode == 6 && prev != 6) ShowBalloon(v.Name, "已保存");
+                        else if (v.StateCode == 3 && prev != 3) ShowBalloon(v.Name, "已关闭");
                     }
                 }
 
                 prevRun.Clear();
                 foreach (var v in vms)
-                    prevRun[v.Guid] = v.Running;
+                    prevRun[v.Guid] = v.StateCode;
             }
             catch { }
         }
@@ -293,6 +305,12 @@ namespace HyperVTray
         private static void ShowBalloon(string name, string action)
         {
             try { tray.ShowBalloonTip(2500, "Hyper-V", name + " " + action, ToolTipIcon.None); }
+            catch { }
+        }
+
+        private static void ShowBalloonText(string text)
+        {
+            try { tray.ShowBalloonTip(2500, "Hyper-V", text, ToolTipIcon.None); }
             catch { }
         }
 
@@ -323,7 +341,8 @@ namespace HyperVTray
                             var v = new VMInfo();
                             v.Name = Convert.ToString(mo["ElementName"]);
                             v.Guid = id;
-                            v.Running = Convert.ToUInt16(mo["EnabledState"]) == 2;
+                            v.StateCode = Convert.ToInt32(mo["EnabledState"]);
+                            v.Running = v.StateCode == 2;
                             if (v.Running) v.UpTimeSeconds = ComputeUpTime(mo["TimeOfLastStateChange"]);
                             if (!string.IsNullOrEmpty(v.Name)) list.Add(v);
                         }
@@ -414,6 +433,13 @@ namespace HyperVTray
             return "已使用 " + FmtMem(used) + " / " + (dynamic ? "最大" : "分配") + " " + FmtMem(max);
         }
 
+        private static string StateText(VMInfo v)
+        {
+            if (v.Running) return "运行中";
+            if (v.StateCode == 6) return "已保存";
+            return "已关闭";
+        }
+
         private static void RebuildMenu(List<VMInfo> vms)
         {
             var menu = tray.ContextMenuStrip;
@@ -421,6 +447,7 @@ namespace HyperVTray
             lock (uptimeEntries) uptimeEntries.Clear();
 
             bool hasRunning = false;
+            bool anySaved = false;
             bool hvEnabled = IsHyperVServiceRunning();
             var hvHeader = new ToolStripMenuItem(hvEnabled ? "已启用 Hyper-V 服务" : "未启用 Hyper-V 服务") { Enabled = false };
             hvHeader.ForeColor = hvEnabled ? Color.Green : Color.Red;
@@ -443,7 +470,7 @@ namespace HyperVTray
                     string vmName = v.Name;
                     string vmGuid = v.Guid;
 
-                    var vmItem = new ToolStripMenuItem(vmName + "  [" + (v.Running ? "运行中" : "已关闭") + "]");
+                    var vmItem = new ToolStripMenuItem(vmName + "  [" + StateText(v) + "]");
                     vmItem.Click += (s, e) => OpenExHyperV();
 
                     if (v.Running)
@@ -468,9 +495,29 @@ namespace HyperVTray
                     if (v.Running)
                     {
                         hasRunning = true;
+                        var save = new ToolStripMenuItem("保存虚拟机状态");
+                        save.Click += (s, e) => StartThread(delegate { SaveVm(vmGuid); });
+                        vmItem.DropDownItems.Add(save);
+
                         var stop = new ToolStripMenuItem("关闭虚拟机");
                         stop.Click += (s, e) => StartThread(delegate { StopVm(vmGuid); });
                         vmItem.DropDownItems.Add(stop);
+                    }
+                    else if (v.StateCode == 6)
+                    {
+                        anySaved = true;
+                        var restore = new ToolStripMenuItem("恢复虚拟机");
+                        restore.Click += (s, e) => StartThread(delegate { StartVm(vmGuid); });
+                        vmItem.DropDownItems.Add(restore);
+
+                        var discard = new ToolStripMenuItem("销毁保存的虚拟机");
+                        discard.Click += (s, e) =>
+                        {
+                            if (MessageBox.Show("确定要销毁「" + vmName + "」的保存状态吗？", "Hyper-V 监控",
+                                MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                                StartThread(delegate { DiscardSavedVm(vmGuid); });
+                        };
+                        vmItem.DropDownItems.Add(discard);
                     }
                     else
                     {
@@ -499,6 +546,31 @@ namespace HyperVTray
                     StopAllVms();
             };
             menu.Items.Add(stopAll);
+
+            var saveAll = new ToolStripMenuItem("保存全部虚拟机");
+            saveAll.Enabled = hasRunning;
+            saveAll.Click += (s, e) =>
+            {
+                if (MessageBox.Show("确定要保存所有虚拟机吗？", "Hyper-V 监控",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                    SaveAllVms();
+            };
+            menu.Items.Add(saveAll);
+
+            var restoreAll = new ToolStripMenuItem("恢复所有保存的虚拟机");
+            restoreAll.Enabled = anySaved;
+            restoreAll.Click += (s, e) => RestoreAllSaved();
+            menu.Items.Add(restoreAll);
+
+            var discardAll = new ToolStripMenuItem("销毁所有保存的虚拟机");
+            discardAll.Enabled = anySaved;
+            discardAll.Click += (s, e) =>
+            {
+                if (MessageBox.Show("确定要销毁所有保存的虚拟机吗？", "Hyper-V 监控",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                    DiscardAllSaved();
+            };
+            menu.Items.Add(discardAll);
 
             var connectAll = new ToolStripMenuItem("连接所有运行中的虚拟机");
             connectAll.Enabled = hasRunning;
@@ -742,15 +814,194 @@ namespace HyperVTray
             {
                 var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                 scope.Connect();
+                RequestState(scope, guid, 2);
+            }
+            catch { }
+        }
+
+        private static void RequestState(ManagementScope scope, string guid, int state)
+        {
+            try
+            {
                 using (ManagementObject mo = GetVmObject(scope, guid))
                 {
                     if (mo == null) return;
                     var p = mo.GetMethodParameters("RequestStateChange");
-                    p["RequestedState"] = 2;
+                    p["RequestedState"] = state;
                     mo.InvokeMethod("RequestStateChange", p, null);
                 }
             }
             catch { }
+        }
+
+        private static void SaveVm(string guid)
+        {
+            try
+            {
+                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                scope.Connect();
+                RequestSave(scope, guid);
+            }
+            catch { }
+        }
+
+        private static void RequestSave(ManagementScope scope, string guid)
+        {
+            RequestState(scope, guid, 6);
+        }
+
+        private static void DiscardSavedVm(string guid)
+        {
+            try
+            {
+                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                scope.Connect();
+                RequestState(scope, guid, 3);
+            }
+            catch { }
+        }
+
+        private static void SaveAllVms()
+        {
+            suppressNotify = true;
+            StartThread(delegate
+            {
+                try
+                {
+                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                    scope.Connect();
+                    var list = new List<string>();
+                    var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
+                    using (var s = new ManagementObjectSearcher(scope, q))
+                    {
+                        foreach (ManagementObject mo in s.Get())
+                        {
+                            try
+                            {
+                                string id = Convert.ToString(mo["Name"]);
+                                Guid g;
+                                if (!Guid.TryParse(id, out g)) continue;
+                                if (Convert.ToInt32(mo["EnabledState"]) == 2) list.Add(id);
+                            }
+                            catch { }
+                        }
+                    }
+                    if (list.Count == 0) return;
+
+                    foreach (string guid in list)
+                        RequestSave(scope, guid);
+
+                    for (int i = 0; i < 15; i++)
+                    {
+                        Thread.Sleep(2000);
+                        bool anyNotSaved = false;
+                        foreach (string guid in list)
+                            if (!IsSaved(scope, guid)) { anyNotSaved = true; break; }
+                        if (!anyNotSaved) break;
+                    }
+
+                    sync.Post(delegate { ShowBalloonText("已保存全部虚拟机"); }, null);
+                }
+                catch { }
+                finally { suppressNotify = false; }
+            });
+        }
+
+        private static bool IsSaved(ManagementScope scope, string guid)
+        {
+            try
+            {
+                using (ManagementObject mo = GetVmObject(scope, guid))
+                {
+                    if (mo == null) return false;
+                    mo.Get();
+                    return Convert.ToInt32(mo["EnabledState"]) == 6;
+                }
+            }
+            catch { return false; }
+        }
+
+        private static List<string> GetSavedVms(ManagementScope scope)
+        {
+            var list = new List<string>();
+            var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
+            using (var s = new ManagementObjectSearcher(scope, q))
+            {
+                foreach (ManagementObject mo in s.Get())
+                {
+                    try
+                    {
+                        string id = Convert.ToString(mo["Name"]);
+                        Guid g;
+                        if (!Guid.TryParse(id, out g)) continue;
+                        if (Convert.ToInt32(mo["EnabledState"]) == 6) list.Add(id);
+                    }
+                    catch { }
+                }
+            }
+            return list;
+        }
+
+        private static void RestoreAllSaved()
+        {
+            suppressNotify = true;
+            StartThread(delegate
+            {
+                try
+                {
+                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                    scope.Connect();
+                    var list = GetSavedVms(scope);
+                    if (list.Count == 0) return;
+
+                    foreach (string guid in list)
+                        RequestState(scope, guid, 2);
+
+                    for (int i = 0; i < 15; i++)
+                    {
+                        Thread.Sleep(2000);
+                        bool anyNotRunning = false;
+                        foreach (string guid in list)
+                            if (GetStateCode(scope, guid) != 2) { anyNotRunning = true; break; }
+                        if (!anyNotRunning) break;
+                    }
+
+                    sync.Post(delegate { ShowBalloonText("已恢复所有虚拟机"); }, null);
+                }
+                catch { }
+                finally { suppressNotify = false; }
+            });
+        }
+
+        private static void DiscardAllSaved()
+        {
+            suppressNotify = true;
+            StartThread(delegate
+            {
+                try
+                {
+                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                    scope.Connect();
+                    var list = GetSavedVms(scope);
+                    if (list.Count == 0) return;
+
+                    foreach (string guid in list)
+                        RequestState(scope, guid, 3);
+
+                    for (int i = 0; i < 15; i++)
+                    {
+                        Thread.Sleep(2000);
+                        bool anyStill = false;
+                        foreach (string guid in list)
+                            if (GetStateCode(scope, guid) != 3) { anyStill = true; break; }
+                        if (!anyStill) break;
+                    }
+
+                    sync.Post(delegate { ShowBalloonText("已销毁全部保存虚拟机"); }, null);
+                }
+                catch { }
+                finally { suppressNotify = false; }
+            });
         }
 
         private static void StopVm(string guid)
@@ -774,6 +1025,7 @@ namespace HyperVTray
 
         private static void StopAllVms()
         {
+            suppressNotify = true;
             StartThread(delegate
             {
                 try
@@ -807,13 +1059,16 @@ namespace HyperVTray
                         bool any = false;
                         foreach (string guid in list)
                             if (IsRunning(scope, guid)) { any = true; break; }
-                        if (!any) return;
+                        if (!any) break;
                     }
 
                     foreach (string guid in list)
                         if (IsRunning(scope, guid)) ForceOff(scope, guid);
+
+                    sync.Post(delegate { ShowBalloonText("已关闭所有虚拟机"); }, null);
                 }
                 catch { }
+                finally { suppressNotify = false; }
             });
         }
 
@@ -849,16 +1104,21 @@ namespace HyperVTray
 
         private static bool IsRunning(ManagementScope scope, string guid)
         {
+            return GetStateCode(scope, guid) == 2;
+        }
+
+        private static int GetStateCode(ManagementScope scope, string guid)
+        {
             try
             {
                 using (ManagementObject mo = GetVmObject(scope, guid))
                 {
-                    if (mo == null) return false;
+                    if (mo == null) return -1;
                     mo.Get();
-                    return Convert.ToUInt16(mo["EnabledState"]) == 2;
+                    return Convert.ToInt32(mo["EnabledState"]);
                 }
             }
-            catch { return false; }
+            catch { return -1; }
         }
     }
 }
