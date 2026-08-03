@@ -445,6 +445,7 @@ namespace HyperVTray
             menu.Items.Add(new ToolStripSeparator());
 
             var openMgr = new ToolStripMenuItem(HasExHyperV() ? "打开 ExHyperV 界面" : "打开 Hyper-V 管理器");
+            openMgr.Enabled = hvEnabled;
             openMgr.Click += (s, e) => OpenExHyperV();
             menu.Items.Add(openMgr);
 
