@@ -37,6 +37,12 @@ namespace HyperVTray
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
+        [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+        private static extern uint ExtractIconEx(string szFileName, int nIconIndex, out IntPtr phiconLarge, out IntPtr phiconSmall, uint nIcons);
+
+        [DllImport("user32.dll")]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
         private const int SW_RESTORE = 9;
         private const string ExHyperVPath = @"C:\ExHyperV_V1.5.0_x64\ExHyperV.exe";
         private const string StartupLnk = @"C:\Users\wunian\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\HyperV-Tray.lnk";
@@ -65,7 +71,7 @@ namespace HyperVTray
             SynchronizationContext.SetSynchronizationContext(sync);
 
             tray = new NotifyIcon();
-            tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            tray.Icon = LoadTrayIcon();
             tray.Text = "Hyper-V 监控";
             tray.Visible = true;
             tray.DoubleClick += (s, e) => OpenExHyperV();
@@ -320,6 +326,30 @@ namespace HyperVTray
                 Application.Exit();
             };
             menu.Items.Add(exit);
+        }
+
+        private static Icon LoadTrayIcon()
+        {
+            try
+            {
+                if (File.Exists(ExHyperVPath))
+                {
+                    IntPtr large, small;
+                    uint n = ExtractIconEx(ExHyperVPath, 0, out large, out small, 1);
+                    if (n > 0 && large != IntPtr.Zero)
+                    {
+                        Icon result;
+                        using (Icon src = Icon.FromHandle(large))
+                            result = (Icon)src.Clone();
+                        if (small != IntPtr.Zero) DestroyIcon(small);
+                        DestroyIcon(large);
+                        return result;
+                    }
+                    if (small != IntPtr.Zero) DestroyIcon(small);
+                }
+            }
+            catch { }
+            return Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         }
 
         private static void OpenExHyperV()
