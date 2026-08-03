@@ -86,6 +86,7 @@ namespace HyperVTray
         private static DateTime menuOpenTime;
         private static readonly Dictionary<string, int> prevRun = new Dictionary<string, int>();
         private static bool suppressNotify;
+        private static bool confirmOpen;
         private static string exHyperVPath;
         private static DateTime exScanTime;
         private static bool firstSync = true;
@@ -211,11 +212,8 @@ namespace HyperVTray
         private static void RefreshMenu()
         {
             List<VMInfo> vms = GetVms();
-            RebuildMenu(vms);
+            bool hasRunning = RebuildMenu(vms);
             menuOpenTime = DateTime.Now;
-            bool hasRunning = false;
-            foreach (var v in vms)
-                if (v.Running) { hasRunning = true; break; }
             uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
         }
 
@@ -304,14 +302,25 @@ namespace HyperVTray
 
         private static void ShowBalloon(string name, string action)
         {
-            try { tray.ShowBalloonTip(2500, "Hyper-V", name + " " + action, ToolTipIcon.None); }
-            catch { }
+            ShowBalloonText(name + " " + action);
         }
 
         private static void ShowBalloonText(string text)
         {
             try { tray.ShowBalloonTip(2500, "Hyper-V", text, ToolTipIcon.None); }
             catch { }
+        }
+
+        private static bool Confirm(string text)
+        {
+            if (confirmOpen) return false;
+            confirmOpen = true;
+            try
+            {
+                return MessageBox.Show(text, "Hyper-V 监控",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+            }
+            finally { confirmOpen = false; }
         }
 
         private static string JoinNames(List<VMInfo> vms)
@@ -440,7 +449,7 @@ namespace HyperVTray
             return "已关闭";
         }
 
-        private static void RebuildMenu(List<VMInfo> vms)
+        private static bool RebuildMenu(List<VMInfo> vms)
         {
             var menu = tray.ContextMenuStrip;
             menu.Items.Clear();
@@ -513,8 +522,7 @@ namespace HyperVTray
                         var discard = new ToolStripMenuItem("销毁保存的虚拟机");
                         discard.Click += (s, e) =>
                         {
-                            if (MessageBox.Show("确定要销毁「" + vmName + "」的保存状态吗？", "Hyper-V 监控",
-                                MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                            if (Confirm("确定要销毁「" + vmName + "」的保存状态吗？"))
                                 StartThread(delegate { DiscardSavedVm(vmGuid); });
                         };
                         vmItem.DropDownItems.Add(discard);
@@ -541,8 +549,7 @@ namespace HyperVTray
             stopAll.Enabled = hasRunning;
             stopAll.Click += (s, e) =>
             {
-                if (MessageBox.Show("确定要关闭所有虚拟机吗？", "Hyper-V 监控",
-                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                if (Confirm("确定要关闭所有虚拟机吗？"))
                     StopAllVms();
             };
             menu.Items.Add(stopAll);
@@ -551,8 +558,7 @@ namespace HyperVTray
             saveAll.Enabled = hasRunning;
             saveAll.Click += (s, e) =>
             {
-                if (MessageBox.Show("确定要保存所有虚拟机吗？", "Hyper-V 监控",
-                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                if (Confirm("确定要保存所有虚拟机吗？"))
                     SaveAllVms();
             };
             menu.Items.Add(saveAll);
@@ -566,8 +572,7 @@ namespace HyperVTray
             discardAll.Enabled = anySaved;
             discardAll.Click += (s, e) =>
             {
-                if (MessageBox.Show("确定要销毁所有保存的虚拟机吗？", "Hyper-V 监控",
-                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                if (Confirm("确定要销毁所有保存的虚拟机吗？"))
                     DiscardAllSaved();
             };
             menu.Items.Add(discardAll);
@@ -600,6 +605,8 @@ namespace HyperVTray
                 Application.Exit();
             };
             menu.Items.Add(exit);
+
+            return hasRunning;
         }
 
         private static bool HasExHyperV()
@@ -870,22 +877,7 @@ namespace HyperVTray
                 {
                     var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                     scope.Connect();
-                    var list = new List<string>();
-                    var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
-                    using (var s = new ManagementObjectSearcher(scope, q))
-                    {
-                        foreach (ManagementObject mo in s.Get())
-                        {
-                            try
-                            {
-                                string id = Convert.ToString(mo["Name"]);
-                                Guid g;
-                                if (!Guid.TryParse(id, out g)) continue;
-                                if (Convert.ToInt32(mo["EnabledState"]) == 2) list.Add(id);
-                            }
-                            catch { }
-                        }
-                    }
+                    var list = GetVmsByState(scope, 2);
                     if (list.Count == 0) return;
 
                     foreach (string guid in list)
@@ -921,7 +913,7 @@ namespace HyperVTray
             catch { return false; }
         }
 
-        private static List<string> GetSavedVms(ManagementScope scope)
+        private static List<string> GetVmsByState(ManagementScope scope, int state)
         {
             var list = new List<string>();
             var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
@@ -934,7 +926,7 @@ namespace HyperVTray
                         string id = Convert.ToString(mo["Name"]);
                         Guid g;
                         if (!Guid.TryParse(id, out g)) continue;
-                        if (Convert.ToInt32(mo["EnabledState"]) == 6) list.Add(id);
+                        if (Convert.ToInt32(mo["EnabledState"]) == state) list.Add(id);
                     }
                     catch { }
                 }
@@ -951,7 +943,7 @@ namespace HyperVTray
                 {
                     var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                     scope.Connect();
-                    var list = GetSavedVms(scope);
+                    var list = GetVmsByState(scope, 6);
                     if (list.Count == 0) return;
 
                     foreach (string guid in list)
@@ -982,7 +974,7 @@ namespace HyperVTray
                 {
                     var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                     scope.Connect();
-                    var list = GetSavedVms(scope);
+                    var list = GetVmsByState(scope, 6);
                     if (list.Count == 0) return;
 
                     foreach (string guid in list)
@@ -1032,22 +1024,7 @@ namespace HyperVTray
                 {
                     var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                     scope.Connect();
-                    var list = new List<string>();
-                    var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
-                    using (var s = new ManagementObjectSearcher(scope, q))
-                    {
-                        foreach (ManagementObject mo in s.Get())
-                        {
-                            try
-                            {
-                                string id = Convert.ToString(mo["Name"]);
-                                Guid g;
-                                if (!Guid.TryParse(id, out g)) continue;
-                                if (Convert.ToUInt16(mo["EnabledState"]) == 2) list.Add(id);
-                            }
-                            catch { }
-                        }
-                    }
+                    var list = GetVmsByState(scope, 2);
                     if (list.Count == 0) return;
 
                     foreach (string guid in list)
