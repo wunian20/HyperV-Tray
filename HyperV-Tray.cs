@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -23,6 +24,9 @@ namespace HyperVTray
         public string Name;
         public string Guid;
         public bool Running;
+        public long UpTimeSeconds;
+        public int CpuLoad = -1;
+        public long MemoryMB;
     }
 
     internal static class Program
@@ -35,18 +39,27 @@ namespace HyperVTray
 
         private const int SW_RESTORE = 9;
         private const string ExHyperVPath = @"C:\ExHyperV_V1.5.0_x64\ExHyperV.exe";
+        private const string StartupLnk = @"C:\Users\wunian\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\HyperV-Tray.lnk";
 
         private static NotifyIcon tray;
         private static System.Windows.Forms.Timer timer;
         private static System.Threading.Timer debounce;
         private static SynchronizationContext sync;
         private static string lastSig = "";
+        private static Mutex mutex;
+        private static List<VMInfo> lastVms = new List<VMInfo>();
+        private static readonly Dictionary<string, bool> prevRun = new Dictionary<string, bool>();
+        private static bool firstSync = true;
 
         [STAThread]
         private static void Main()
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            bool createdNew;
+            mutex = new Mutex(true, @"Global\HyperV-Tray_SingleInstance", out createdNew);
+            if (!createdNew) return;
 
             sync = new WindowsFormsSynchronizationContext();
             SynchronizationContext.SetSynchronizationContext(sync);
@@ -74,6 +87,7 @@ namespace HyperVTray
         private static void UpdateStatus()
         {
             List<VMInfo> vms = GetVms();
+            lastVms = vms;
             var running = new List<VMInfo>();
             foreach (var v in vms)
                 if (v.Running) running.Add(v);
@@ -83,7 +97,6 @@ namespace HyperVTray
                 if (!tray.Visible)
                 {
                     tray.Visible = true;
-                    tray.ShowBalloonTip(3000, "Hyper-V", "虚拟机正在运行: " + JoinNames(running), ToolTipIcon.Info);
                 }
                 string tip = "Hyper-V 运行中: " + JoinNames(running);
                 if (tip.Length > 63) tip = tip.Substring(0, 60) + "...";
@@ -95,6 +108,8 @@ namespace HyperVTray
                 tray.Text = "Hyper-V 监控";
             }
 
+            NotifyTransitions(vms);
+
             string sig = "";
             foreach (var v in vms)
                 sig += v.Name + ":" + (v.Running ? "1" : "0") + "|";
@@ -103,6 +118,49 @@ namespace HyperVTray
                 lastSig = sig;
                 RebuildMenu(vms);
             }
+        }
+
+        private static void NotifyTransitions(List<VMInfo> vms)
+        {
+            try
+            {
+                var current = new Dictionary<string, bool>();
+                foreach (var v in vms)
+                    current[v.Guid] = v.Running;
+
+                if (firstSync)
+                {
+                    firstSync = false;
+                }
+                else
+                {
+                    foreach (var kv in current)
+                    {
+                        bool prev;
+                        if (!prevRun.TryGetValue(kv.Key, out prev)) continue;
+                        if (kv.Value && !prev)
+                        {
+                            tray.ShowBalloonTip(2500, "Hyper-V", FindName(vms, kv.Key) + " 已启动", ToolTipIcon.Info);
+                        }
+                        else if (!kv.Value && prev)
+                        {
+                            tray.ShowBalloonTip(2500, "Hyper-V", FindName(vms, kv.Key) + " 已关闭", ToolTipIcon.Info);
+                        }
+                    }
+                }
+
+                prevRun.Clear();
+                foreach (var kv in current)
+                    prevRun[kv.Key] = kv.Value;
+            }
+            catch { }
+        }
+
+        private static string FindName(List<VMInfo> vms, string guid)
+        {
+            foreach (var v in vms)
+                if (v.Guid == guid) return v.Name;
+            return guid;
         }
 
         private static string JoinNames(List<VMInfo> vms)
@@ -119,7 +177,7 @@ namespace HyperVTray
             {
                 var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                 scope.Connect();
-                var query = new ObjectQuery("SELECT Name, ElementName, EnabledState FROM Msvm_ComputerSystem");
+                var query = new ObjectQuery("SELECT Name, ElementName, EnabledState, TimeOfLastStateChange FROM Msvm_ComputerSystem");
                 using (var searcher = new ManagementObjectSearcher(scope, query))
                 {
                     foreach (ManagementObject mo in searcher.Get())
@@ -133,15 +191,62 @@ namespace HyperVTray
                             v.Name = Convert.ToString(mo["ElementName"]);
                             v.Guid = id;
                             v.Running = (Convert.ToUInt16(mo["EnabledState"]) == 2);
+                            if (v.Running) v.UpTimeSeconds = ComputeUpTime(mo["TimeOfLastStateChange"]);
                             if (!string.IsNullOrEmpty(v.Name)) list.Add(v);
                         }
                         catch { }
                     }
                 }
+
+                foreach (var v in list)
+                    if (v.Running) EnrichVmInfo(scope, v);
             }
             catch { }
             list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
             return list;
+        }
+
+        private static long ComputeUpTime(object raw)
+        {
+            try
+            {
+                if (raw == null) return 0;
+                string s = raw as string;
+                if (s == null) return 0;
+                DateTime dt = ManagementDateTimeConverter.ToDateTime(s);
+                long sec = (long)(DateTime.Now - dt).TotalSeconds;
+                return sec > 0 ? sec : 0;
+            }
+            catch { return 0; }
+        }
+
+        private static void EnrichVmInfo(ManagementScope scope, VMInfo v)
+        {
+            try
+            {
+                var cpuQuery = new ObjectQuery("SELECT LoadPercentage FROM Msvm_Processor WHERE SystemName='" + v.Guid + "'");
+                long total = 0, count = 0;
+                using (var s = new ManagementObjectSearcher(scope, cpuQuery))
+                {
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        object val = mo["LoadPercentage"];
+                        if (val != null) { total += Convert.ToInt64(val); count++; }
+                    }
+                }
+                if (count > 0) v.CpuLoad = (int)(total / count);
+
+                var memQuery = new ObjectQuery("SELECT VirtualQuantity FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
+                using (var s = new ManagementObjectSearcher(scope, memQuery))
+                {
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        object val = mo["VirtualQuantity"];
+                        if (val != null && Convert.ToInt64(val) > v.MemoryMB) v.MemoryMB = Convert.ToInt64(val);
+                    }
+                }
+            }
+            catch { }
         }
 
         private static void RebuildMenu(List<VMInfo> vms)
@@ -165,6 +270,15 @@ namespace HyperVTray
 
                     var vmItem = new ToolStripMenuItem(vmName + "  [" + (v.Running ? "运行中" : "已关闭") + "]");
                     vmItem.Click += (s, e) => OpenExHyperV();
+
+                    if (v.Running)
+                    {
+                        string detail = "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--");
+                        detail += " | 内存 " + (v.MemoryMB > 0 ? (v.MemoryMB / 1024.0).ToString("0.#") + " GB" : "--");
+                        long s0 = v.UpTimeSeconds;
+                        detail += " | 已运行 " + string.Format("{0:D2}:{1:D2}:{2:D2}", s0 / 3600, (s0 / 60) % 60, s0 % 60);
+                        vmItem.DropDownItems.Add(new ToolStripMenuItem(detail) { Enabled = false });
+                    }
 
                     var open = new ToolStripMenuItem("打开 ExHyperV 界面");
                     open.Click += (s, e) => OpenExHyperV();
@@ -192,6 +306,15 @@ namespace HyperVTray
             var refresh = new ToolStripMenuItem("立即刷新");
             refresh.Click += (s, e) => UpdateStatus();
             menu.Items.Add(refresh);
+
+            var auto = new ToolStripMenuItem("开机自启");
+            auto.Checked = File.Exists(StartupLnk);
+            auto.Click += (s, e) =>
+            {
+                ToggleAutostart();
+                auto.Checked = File.Exists(StartupLnk);
+            };
+            menu.Items.Add(auto);
 
             var exit = new ToolStripMenuItem("退出");
             exit.Click += (s, e) =>
@@ -229,6 +352,31 @@ namespace HyperVTray
         {
             var t = new System.Threading.Thread(action) { IsBackground = true };
             t.Start();
+        }
+
+        private static void ToggleAutostart()
+        {
+            try
+            {
+                if (File.Exists(StartupLnk))
+                {
+                    File.Delete(StartupLnk);
+                }
+                else
+                {
+                    string dir = Path.GetDirectoryName(StartupLnk);
+                    if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                    Type t = Type.GetTypeFromProgID("WScript.Shell");
+                    dynamic shell = Activator.CreateInstance(t);
+                    dynamic sc = shell.CreateShortcut(StartupLnk);
+                    sc.TargetPath = Application.ExecutablePath;
+                    sc.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+                    sc.IconLocation = Application.ExecutablePath + ",0";
+                    sc.Description = "Hyper-V 托盘监控";
+                    sc.Save();
+                }
+            }
+            catch { }
         }
 
         private static void WatchLoop()
