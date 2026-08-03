@@ -29,6 +29,7 @@ namespace HyperVTray
         public bool Running;
         public long UpTimeSeconds;
         public int CpuLoad = -1;
+        public long MemoryUsedMB;
         public long MemoryMB;
     }
 
@@ -37,7 +38,7 @@ namespace HyperVTray
         public string Guid;
         public ToolStripItem Detail;
         public long BaseSeconds;
-        public string MemText;
+        public long AllocatedMB;
     }
 
     internal static class Program
@@ -149,8 +150,9 @@ namespace HyperVTray
                 for (int i = 0; i < entries.Length; i++)
                 {
                     int cpu = QueryCpu(scope, entries[i].Guid);
+                    long used = QueryUsedMem(scope, entries[i].Guid);
                     texts[i] = "CPU " + (cpu >= 0 ? cpu + "%" : "--")
-                        + " | 内存 " + entries[i].MemText
+                        + " | 已使用 " + FmtMem(used) + " / 分配 " + FmtMem(entries[i].AllocatedMB)
                         + " | 已运行 " + FormatUptime(entries[i].BaseSeconds + nowSec);
                 }
 
@@ -265,6 +267,7 @@ namespace HyperVTray
             try
             {
                 v.CpuLoad = QueryCpu(scope, v.Guid);
+                v.MemoryUsedMB = QueryUsedMem(scope, v.Guid);
 
                 var memQuery = new ObjectQuery("SELECT VirtualQuantity FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
                 using (var s = new ManagementObjectSearcher(scope, memQuery))
@@ -292,6 +295,26 @@ namespace HyperVTray
                 }
             }
             return count > 0 ? (int)(total / count) : -1;
+        }
+
+        private static long QueryUsedMem(ManagementScope scope, string guid)
+        {
+            long used = 0;
+            var q = new ObjectQuery("SELECT MemoryUsage FROM Msvm_SummaryInformation WHERE Name='" + guid + "'");
+            using (var s = new ManagementObjectSearcher(scope, q))
+            {
+                foreach (ManagementObject mo in s.Get())
+                {
+                    object val = mo["MemoryUsage"];
+                    if (val != null) used = Convert.ToInt64(val);
+                }
+            }
+            return used;
+        }
+
+        private static string FmtMem(long mb)
+        {
+            return mb > 0 ? (mb / 1024.0).ToString("0.#") + " GB" : "--";
         }
 
         private static void RebuildMenu(List<VMInfo> vms)
@@ -322,9 +345,9 @@ namespace HyperVTray
                         entry.Guid = v.Guid;
                         entry.Detail = new ToolStripMenuItem { Enabled = false };
                         entry.BaseSeconds = v.UpTimeSeconds;
-                        entry.MemText = v.MemoryMB > 0 ? (v.MemoryMB / 1024.0).ToString("0.#") + " GB" : "--";
+                        entry.AllocatedMB = v.MemoryMB;
                         entry.Detail.Text = "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--")
-                            + " | 内存 " + entry.MemText
+                            + " | 已使用 " + FmtMem(v.MemoryUsedMB) + " / 分配 " + FmtMem(v.MemoryMB)
                             + " | 已运行 " + FormatUptime(v.UpTimeSeconds);
                         vmItem.DropDownItems.Add(entry.Detail);
                         lock (uptimeEntries) uptimeEntries.Add(entry);
