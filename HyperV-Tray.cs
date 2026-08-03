@@ -88,8 +88,11 @@ namespace HyperVTray
         private static readonly List<UptimeEntry> uptimeEntries = new List<UptimeEntry>();
         private static DateTime menuOpenTime;
         private static readonly Dictionary<string, int> prevRun = new Dictionary<string, int>();
-        private static bool suppressNotify;
-        private static bool confirmOpen;
+        private static volatile bool suppressNotify;
+        private static volatile bool confirmOpen;
+        private static volatile bool forceRefresh;
+        private static readonly object cacheLock = new object();
+        private static ManagementScope wmiScope;
         private static string exHyperVPath;
         private static DateTime exScanTime;
         private static bool firstSync = true;
@@ -215,6 +218,12 @@ namespace HyperVTray
 
         private static void UpdateStatus()
         {
+            if (forceRefresh)
+            {
+                // WMI 事件驱动的刷新：先清缓存强制重新查询，图标/通知秒级响应
+                forceRefresh = false;
+                lock (cacheLock) cachedVms = null;
+            }
             List<VMInfo> vms = GetVms();
             if (vms == null)
             {
@@ -284,8 +293,7 @@ namespace HyperVTray
                 lock (uptimeEntries) entries = uptimeEntries.ToArray();
                 if (entries.Length == 0) return;
 
-                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                scope.Connect();
+                var scope = GetScope();
                 long nowSec = (long)(DateTime.Now - menuOpenTime).TotalSeconds;
 
                 var texts = new string[entries.Length];
@@ -385,17 +393,29 @@ namespace HyperVTray
             return string.Join(", ", names.ToArray());
         }
 
+        private static ManagementScope GetScope()
+        {
+            if (wmiScope == null)
+            {
+                wmiScope = new ManagementScope(@"\\.\root\virtualization\v2");
+                wmiScope.Connect();
+            }
+            return wmiScope;
+        }
+
         private static List<VMInfo> GetVms()
         {
             // 1.5 秒内复用上次查询结果：右键弹菜单、状态刷新立即响应，避免每次重复 WMI 查询卡顿
-            if (cachedVms != null && (DateTime.Now - cacheTime).TotalSeconds < 1.5)
-                return cachedVms;
+            lock (cacheLock)
+            {
+                if (cachedVms != null && (DateTime.Now - cacheTime).TotalSeconds < 1.5)
+                    return cachedVms;
+            }
 
             var list = new List<VMInfo>();
             try
             {
-                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                scope.Connect();
+                var scope = GetScope();
                 var query = new ObjectQuery("SELECT Name, ElementName, EnabledState, TimeOfLastStateChange FROM Msvm_ComputerSystem");
                 using (var searcher = new ManagementObjectSearcher(scope, query))
                 {
@@ -427,8 +447,11 @@ namespace HyperVTray
                 return null;
             }
             list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
-            cachedVms = list;
-            cacheTime = DateTime.Now;
+            lock (cacheLock)
+            {
+                cachedVms = list;
+                cacheTime = DateTime.Now;
+            }
             return list;
         }
 
@@ -885,7 +908,11 @@ namespace HyperVTray
 
         private static void PostUpdate()
         {
-            try { sync.Post(delegate { UpdateStatus(); }, null); }
+            try
+            {
+                forceRefresh = true;
+                sync.Post(delegate { UpdateStatus(); }, null);
+            }
             catch (Exception ex) { LogEx("PostUpdate", ex); }
         }
 
@@ -910,8 +937,7 @@ namespace HyperVTray
         {
             try
             {
-                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                scope.Connect();
+                var scope = GetScope();
                 RequestState(scope, guid, 2);
             }
             catch (Exception ex) { LogEx("StartVm", ex); }
@@ -936,8 +962,7 @@ namespace HyperVTray
         {
             try
             {
-                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                scope.Connect();
+                var scope = GetScope();
                 RequestSave(scope, guid);
             }
             catch (Exception ex) { LogEx("SaveVm", ex); }
@@ -952,8 +977,7 @@ namespace HyperVTray
         {
             try
             {
-                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                scope.Connect();
+                var scope = GetScope();
                 RequestState(scope, guid, 3);
             }
             catch (Exception ex) { LogEx("DiscardSavedVm", ex); }
@@ -966,8 +990,7 @@ namespace HyperVTray
             {
                 try
                 {
-                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                    scope.Connect();
+                    var scope = GetScope();
                     var list = GetVmsByState(scope, 2);
                     if (list.Count == 0) return;
 
@@ -1007,6 +1030,18 @@ namespace HyperVTray
         private static List<string> GetVmsByState(ManagementScope scope, int state)
         {
             var list = new List<string>();
+
+            // 优先复用 GetVms 的 1.5 秒缓存，避免批量操作重复全量查询
+            lock (cacheLock)
+            {
+                if (cachedVms != null && (DateTime.Now - cacheTime).TotalSeconds < 1.5)
+                {
+                    foreach (var v in cachedVms)
+                        if (v.StateCode == state) list.Add(v.Guid);
+                    return list;
+                }
+            }
+
             var q = new ObjectQuery("SELECT Name, EnabledState FROM Msvm_ComputerSystem");
             using (var s = new ManagementObjectSearcher(scope, q))
             {
@@ -1032,8 +1067,7 @@ namespace HyperVTray
             {
                 try
                 {
-                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                    scope.Connect();
+                    var scope = GetScope();
                     var list = GetVmsByState(scope, 6);
                     if (list.Count == 0) return;
 
@@ -1063,8 +1097,7 @@ namespace HyperVTray
             {
                 try
                 {
-                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                    scope.Connect();
+                    var scope = GetScope();
                     var list = GetVmsByState(scope, 6);
                     if (list.Count == 0) return;
 
@@ -1091,8 +1124,7 @@ namespace HyperVTray
         {
             try
             {
-                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                scope.Connect();
+                var scope = GetScope();
                 GracefulShutdown(scope, guid);
 
                 for (int i = 0; i < 15; i++)
@@ -1113,8 +1145,7 @@ namespace HyperVTray
             {
                 try
                 {
-                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
-                    scope.Connect();
+                    var scope = GetScope();
                     var list = GetVmsByState(scope, 2);
                     if (list.Count == 0) return;
 
