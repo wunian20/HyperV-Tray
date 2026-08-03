@@ -461,7 +461,7 @@ namespace HyperVTray
                         lock (uptimeEntries) uptimeEntries.Add(entry);
                     }
 
-                    var connect = new ToolStripMenuItem("使用 vmconnect 连接");
+                    var connect = new ToolStripMenuItem("连接虚拟机");
                     connect.Click += (s, e) => ConnectVm(vmName);
                     vmItem.DropDownItems.Add(connect);
 
