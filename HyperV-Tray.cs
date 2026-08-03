@@ -93,6 +93,8 @@ namespace HyperVTray
         private static string exHyperVPath;
         private static DateTime exScanTime;
         private static bool firstSync = true;
+        private static List<VMInfo> cachedVms;
+        private static DateTime cacheTime = DateTime.MinValue;
 
         private static void Log(string msg)
         {
@@ -208,7 +210,7 @@ namespace HyperVTray
                     Application.Run();
                 }
             }
-            catch { }
+            catch (Exception ex) { LogEx("RunTestNotify", ex); }
         }
 
         private static void UpdateStatus()
@@ -289,8 +291,20 @@ namespace HyperVTray
                 var texts = new string[entries.Length];
                 for (int i = 0; i < entries.Length; i++)
                 {
-                    int cpu = QueryCpu(scope, entries[i].Guid);
-                    long used = QueryUsedMem(scope, entries[i].Guid);
+                    int cpu = -1;
+                    long used = 0;
+                    // 一次 Msvm_SummaryInformation 查询同时取 CPU 与内存，替代两次查询
+                    var q = new ObjectQuery("SELECT ProcessorLoad, MemoryUsage FROM Msvm_SummaryInformation WHERE Name='" + entries[i].Guid + "'");
+                    using (var s = new ManagementObjectSearcher(scope, q))
+                    {
+                        foreach (ManagementObject mo in s.Get())
+                        {
+                            object load = mo["ProcessorLoad"];
+                            if (load != null) cpu = Convert.ToInt32(load);
+                            object mem = mo["MemoryUsage"];
+                            if (mem != null) used = Convert.ToInt64(mem);
+                        }
+                    }
                     texts[i] = "CPU " + (cpu >= 0 ? cpu + "%" : "--")
                         + " | " + MemInfo(used, entries[i].AllocatedMB, entries[i].DynamicMemory)
                         + " | 已运行 " + FormatUptime(entries[i].BaseSeconds + nowSec);
@@ -373,6 +387,10 @@ namespace HyperVTray
 
         private static List<VMInfo> GetVms()
         {
+            // 1.5 秒内复用上次查询结果：右键弹菜单、状态刷新立即响应，避免每次重复 WMI 查询卡顿
+            if (cachedVms != null && (DateTime.Now - cacheTime).TotalSeconds < 1.5)
+                return cachedVms;
+
             var list = new List<VMInfo>();
             try
             {
@@ -409,6 +427,8 @@ namespace HyperVTray
                 return null;
             }
             list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
+            cachedVms = list;
+            cacheTime = DateTime.Now;
             return list;
         }
 
@@ -422,15 +442,27 @@ namespace HyperVTray
                 long sec = (long)(DateTime.Now - dt).TotalSeconds;
                 return sec > 0 ? sec : 0;
             }
-            catch { return 0; }
+            catch (Exception ex) { LogEx("ComputeUpTime", ex); return 0; }
         }
 
         private static void EnrichVmInfo(ManagementScope scope, VMInfo v)
         {
             try
             {
-                v.CpuLoad = QueryCpu(scope, v.Guid);
-                v.MemoryUsedMB = QueryUsedMem(scope, v.Guid);
+                // 一次 Msvm_SummaryInformation 查询同时取 CPU、内存、运行时长，替代多次查询
+                var q = new ObjectQuery("SELECT ProcessorLoad, MemoryUsage, UpTime FROM Msvm_SummaryInformation WHERE Name='" + v.Guid + "'");
+                using (var s = new ManagementObjectSearcher(scope, q))
+                {
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        object load = mo["ProcessorLoad"];
+                        if (load != null) v.CpuLoad = Convert.ToInt32(load);
+                        object mem = mo["MemoryUsage"];
+                        if (mem != null) v.MemoryUsedMB = Convert.ToInt64(mem);
+                        object up = mo["UpTime"];
+                        if (up != null && Convert.ToInt64(up) > 0) v.UpTimeSeconds = Convert.ToInt64(up);
+                    }
+                }
 
                 var memQuery = new ObjectQuery("SELECT Limit, DynamicMemoryEnabled FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
                 using (var s = new ManagementObjectSearcher(scope, memQuery))
@@ -445,36 +477,6 @@ namespace HyperVTray
                 }
             }
             catch (Exception ex) { LogEx("EnrichVmInfo", ex); }
-        }
-
-        private static int QueryCpu(ManagementScope scope, string guid)
-        {
-            long total = 0, count = 0;
-            var q = new ObjectQuery("SELECT LoadPercentage FROM Msvm_Processor WHERE SystemName='" + guid + "'");
-            using (var s = new ManagementObjectSearcher(scope, q))
-            {
-                foreach (ManagementObject mo in s.Get())
-                {
-                    object val = mo["LoadPercentage"];
-                    if (val != null) { total += Convert.ToInt64(val); count++; }
-                }
-            }
-            return count > 0 ? (int)(total / count) : -1;
-        }
-
-        private static long QueryUsedMem(ManagementScope scope, string guid)
-        {
-            long used = 0;
-            var q = new ObjectQuery("SELECT MemoryUsage FROM Msvm_SummaryInformation WHERE Name='" + guid + "'");
-            using (var s = new ManagementObjectSearcher(scope, q))
-            {
-                foreach (ManagementObject mo in s.Get())
-                {
-                    object val = mo["MemoryUsage"];
-                    if (val != null) used = Convert.ToInt64(val);
-                }
-            }
-            return used;
         }
 
         private static string FmtMem(long mb)
@@ -983,7 +985,7 @@ namespace HyperVTray
 
                     sync.Post(delegate { ShowBalloonText("已保存全部虚拟机"); }, null);
                 }
-                catch { }
+                catch (Exception ex) { LogEx("SaveAllVms", ex); }
                 finally { suppressNotify = false; }
             });
         }
@@ -999,7 +1001,7 @@ namespace HyperVTray
                     return Convert.ToInt32(mo["EnabledState"]) == 6;
                 }
             }
-            catch { return false; }
+            catch (Exception ex) { LogEx("IsSaved", ex); return false; }
         }
 
         private static List<string> GetVmsByState(ManagementScope scope, int state)
@@ -1017,7 +1019,7 @@ namespace HyperVTray
                         if (!Guid.TryParse(id, out g)) continue;
                         if (Convert.ToInt32(mo["EnabledState"]) == state) list.Add(id);
                     }
-                    catch { }
+                    catch (Exception ex) { LogEx("GetVmsByState.Item", ex); }
                 }
             }
             return list;
@@ -1049,7 +1051,7 @@ namespace HyperVTray
 
                     sync.Post(delegate { ShowBalloonText("已恢复所有虚拟机"); }, null);
                 }
-                catch { }
+                catch (Exception ex) { LogEx("RestoreAllSaved", ex); }
                 finally { suppressNotify = false; }
             });
         }
@@ -1080,7 +1082,7 @@ namespace HyperVTray
 
                     sync.Post(delegate { ShowBalloonText("已销毁全部保存虚拟机"); }, null);
                 }
-                catch { }
+                catch (Exception ex) { LogEx("DiscardAllSaved", ex); }
                 finally { suppressNotify = false; }
             });
         }
@@ -1133,7 +1135,7 @@ namespace HyperVTray
 
                     sync.Post(delegate { ShowBalloonText("已关闭所有虚拟机"); }, null);
                 }
-                catch { }
+                catch (Exception ex) { LogEx("StopAllVms", ex); }
                 finally { suppressNotify = false; }
             });
         }
@@ -1152,7 +1154,7 @@ namespace HyperVTray
                         p["Reason"] = 0;
                         sh.InvokeMethod("InitiateShutdown", p, null);
                     }
-                    catch { }
+                    catch (Exception ex) { LogEx("GracefulShutdown", ex); }
                 }
             }
         }
@@ -1184,7 +1186,7 @@ namespace HyperVTray
                     return Convert.ToInt32(mo["EnabledState"]);
                 }
             }
-            catch { return -1; }
+            catch (Exception ex) { LogEx("GetStateCode", ex); return -1; }
         }
     }
 }
