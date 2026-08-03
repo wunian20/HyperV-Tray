@@ -69,8 +69,11 @@ namespace HyperVTray
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         private const int SW_RESTORE = 9;
-        private const string ExHyperVPath = @"C:\ExHyperV_V1.5.0_x64\ExHyperV.exe";
-        private const string StartupLnk = @"C:\Users\wunian\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\HyperV-Tray.lnk";
+
+        private static readonly bool debugLog = string.Equals(
+            Environment.GetEnvironmentVariable("HYPERV_TRAY_DEBUG"), "1", StringComparison.OrdinalIgnoreCase);
+        private static readonly string StartupLnk = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Startup), "HyperV-Tray.lnk");
 
         private static NotifyIcon tray;
         private static Icon baseIcon;
@@ -91,6 +94,30 @@ namespace HyperVTray
         private static DateTime exScanTime;
         private static bool firstSync = true;
 
+        private static void Log(string msg)
+        {
+            if (!debugLog) return;
+            try
+            {
+                string path = Path.Combine(Path.GetTempPath(), "HyperV-Tray.log");
+                using (var w = File.AppendText(path))
+                    w.WriteLine(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + msg);
+            }
+            catch { }
+        }
+
+        private static void LogEx(string where, Exception ex)
+        {
+            if (!debugLog) return;
+            try
+            {
+                string path = Path.Combine(Path.GetTempPath(), "HyperV-Tray.log");
+                using (var w = File.AppendText(path))
+                    w.WriteLine(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + where + "] " + ex);
+            }
+            catch { }
+        }
+
         [STAThread]
         private static void Main()
         {
@@ -108,7 +135,13 @@ namespace HyperVTray
 
             bool createdNew;
             mutex = new Mutex(true, @"Global\HyperV-Tray_SingleInstance", out createdNew);
-            if (!createdNew) return;
+            if (!createdNew)
+            {
+                // 前一个实例异常退出后 mutex 会处于 abandoned 状态，此时应尝试接管而不是直接退出
+                try { createdNew = mutex.WaitOne(0); }
+                catch (AbandonedMutexException) { createdNew = true; }
+                if (!createdNew) return;
+            }
 
             sync = new WindowsFormsSynchronizationContext();
             SynchronizationContext.SetSynchronizationContext(sync);
@@ -134,7 +167,7 @@ namespace HyperVTray
                 using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Red"))
                     if (s != null) redIcon = new Icon(s);
             }
-            catch { }
+            catch (Exception ex) { LogEx("LoadIcons", ex); }
 
             uptimeTick = new ThreadingTimer(delegate { TickUptime(); }, null, Timeout.Infinite, Timeout.Infinite);
 
@@ -181,6 +214,14 @@ namespace HyperVTray
         private static void UpdateStatus()
         {
             List<VMInfo> vms = GetVms();
+            if (vms == null)
+            {
+                // WMI 查询失败：红色图标 + 明确提示，避免被误认为“没有虚拟机”
+                tray.Icon = redIcon != null ? redIcon : baseIcon;
+                tray.Text = "Hyper-V 监控（查询失败）";
+                tray.Visible = true;
+                return;
+            }
 
             var running = new List<VMInfo>();
             bool anySaved = false;
@@ -230,7 +271,7 @@ namespace HyperVTray
                 if (y < wa.Top) y = wa.Top;
                 if (x != menu.Left || y != menu.Top) menu.Location = new Point(x, y);
             }
-            catch { }
+            catch (Exception ex) { LogEx("AdjustMenuBounds", ex); }
         }
 
         private static void TickUptime()
@@ -262,10 +303,10 @@ namespace HyperVTray
                         for (int i = 0; i < entries.Length; i++)
                             entries[i].Detail.Text = texts[i];
                     }
-                    catch { }
+                    catch (Exception ex) { LogEx("TickUptime.UI", ex); }
                 }, null);
             }
-            catch { }
+            catch (Exception ex) { LogEx("TickUptime", ex); }
         }
 
         private static string FormatUptime(long sec)
@@ -297,7 +338,7 @@ namespace HyperVTray
                 foreach (var v in vms)
                     prevRun[v.Guid] = v.StateCode;
             }
-            catch { }
+            catch (Exception ex) { LogEx("NotifyTransitions", ex); }
         }
 
         private static void ShowBalloon(string name, string action)
@@ -308,7 +349,7 @@ namespace HyperVTray
         private static void ShowBalloonText(string text)
         {
             try { tray.ShowBalloonTip(2500, "Hyper-V", text, ToolTipIcon.None); }
-            catch { }
+            catch (Exception ex) { LogEx("ShowBalloonText", ex); }
         }
 
         private static bool Confirm(string text)
@@ -355,14 +396,18 @@ namespace HyperVTray
                             if (v.Running) v.UpTimeSeconds = ComputeUpTime(mo["TimeOfLastStateChange"]);
                             if (!string.IsNullOrEmpty(v.Name)) list.Add(v);
                         }
-                        catch { }
+                        catch (Exception ex) { LogEx("GetVms.Item", ex); }
                     }
                 }
 
                 foreach (var v in list)
                     if (v.Running) EnrichVmInfo(scope, v);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                LogEx("GetVms", ex);
+                return null;
+            }
             list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
             return list;
         }
@@ -399,7 +444,7 @@ namespace HyperVTray
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { LogEx("EnrichVmInfo", ex); }
         }
 
         private static int QueryCpu(ManagementScope scope, string guid)
@@ -442,11 +487,25 @@ namespace HyperVTray
             return "已使用 " + FmtMem(used) + " / " + (dynamic ? "最大" : "分配") + " " + FmtMem(max);
         }
 
+        private static bool IsPaused(VMInfo v)
+        {
+            return v.StateCode == 9 || v.StateCode == 32768;
+        }
+
         private static string StateText(VMInfo v)
         {
-            if (v.Running) return "运行中";
-            if (v.StateCode == 6) return "已保存";
-            return "已关闭";
+            switch (v.StateCode)
+            {
+                case 2: return "运行中";
+                case 3: return "已关闭";
+                case 4: return "停止中";
+                case 5: return "启动中";
+                case 6: return "已保存";
+                case 9:
+                case 32768: return "已暂停";
+                case 10: return "暂停中";
+                default: return "状态 " + v.StateCode;
+            }
         }
 
         private static bool RebuildMenu(List<VMInfo> vms)
@@ -468,7 +527,11 @@ namespace HyperVTray
 
             menu.Items.Add(new ToolStripSeparator());
 
-            if (vms.Count == 0)
+            if (vms == null)
+            {
+                menu.Items.Add(new ToolStripMenuItem("(查询失败，请点“立即刷新”重试)") { Enabled = false });
+            }
+            else if (vms.Count == 0)
             {
                 menu.Items.Add(new ToolStripMenuItem("(没有虚拟机)") { Enabled = false });
             }
@@ -527,12 +590,20 @@ namespace HyperVTray
                         };
                         vmItem.DropDownItems.Add(discard);
                     }
-                    else
+                    else if (IsPaused(v))
+                    {
+                        // 已暂停：只能恢复（请求回到运行态），不提供其他操作
+                        var resume = new ToolStripMenuItem("恢复虚拟机");
+                        resume.Click += (s, e) => StartThread(delegate { StartVm(vmGuid); });
+                        vmItem.DropDownItems.Add(resume);
+                    }
+                    else if (v.StateCode == 3)
                     {
                         var start = new ToolStripMenuItem("启动虚拟机");
                         start.Click += (s, e) => StartThread(delegate { StartVm(vmGuid); });
                         vmItem.DropDownItems.Add(start);
                     }
+                    // 过渡状态（启动中/停止中/暂停中）及未知状态：仅提供连接，避免误操作
 
                     menu.Items.Add(vmItem);
                 }
@@ -621,7 +692,7 @@ namespace HyperVTray
                 using (var sc = new ServiceController("vmms"))
                     return sc.Status == ServiceControllerStatus.Running;
             }
-            catch { return false; }
+            catch (Exception ex) { LogEx("IsHyperVServiceRunning", ex); return false; }
         }
 
         private static string FindExHyperV()
@@ -631,13 +702,11 @@ namespace HyperVTray
             exHyperVPath = null;
             try
             {
-                if (File.Exists(ExHyperVPath)) { exHyperVPath = ExHyperVPath; return exHyperVPath; }
-
                 Process[] procs = Process.GetProcessesByName("ExHyperV");
                 if (procs.Length > 0)
                 {
                     try { exHyperVPath = procs[0].MainModule.FileName; return exHyperVPath; }
-                    catch { }
+                    catch (Exception ex) { LogEx("FindExHyperV.Proc", ex); }
                 }
 
                 string[] dirs = {
@@ -651,6 +720,17 @@ namespace HyperVTray
                     string p = Path.Combine(dir, "ExHyperV.exe");
                     if (File.Exists(p)) { exHyperVPath = p; return exHyperVPath; }
                 }
+
+                // 兜底：扫描 C:\ 根目录下所有 ExHyperV* 目录（兼容带版本号的安装目录，如 C:\ExHyperV_V1.5.0_x64）
+                try
+                {
+                    foreach (string d in Directory.GetDirectories(@"C:\", "ExHyperV*"))
+                    {
+                        string p = Path.Combine(d, "ExHyperV.exe");
+                        if (File.Exists(p)) { exHyperVPath = p; return exHyperVPath; }
+                    }
+                }
+                catch (Exception ex) { LogEx("FindExHyperV.ScanRoot", ex); }
 
                 string[] menuRoots = {
                     Environment.GetFolderPath(Environment.SpecialFolder.Programs),
@@ -672,11 +752,11 @@ namespace HyperVTray
                                 return exHyperVPath;
                             }
                         }
-                        catch { }
+                        catch (Exception ex) { LogEx("FindExHyperV.Lnk", ex); }
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { LogEx("FindExHyperV", ex); }
             return exHyperVPath;
         }
 
@@ -701,34 +781,42 @@ namespace HyperVTray
                     else OpenHyperVManager();
                 }
             }
-            catch { OpenHyperVManager(); }
+            catch (Exception ex) { LogEx("OpenExHyperV", ex); OpenHyperVManager(); }
         }
 
         private static void OpenHyperVManager()
         {
             try { Process.Start("virtmgmt.msc"); }
-            catch { }
+            catch (Exception ex) { LogEx("OpenHyperVManager", ex); }
+        }
+
+        private static string QuoteArg(string arg)
+        {
+            // 按 Windows 命令行规则转义：引号包裹，内部的 \" 与 \\ 转义，避免 VM 名含特殊字符时被当作命令行解析（参数注入）
+            return "\"" + arg.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
         private static void ConnectVm(string name)
         {
             try
             {
-                var psi = new ProcessStartInfo("vmconnect.exe", "localhost \"" + name + "\"");
+                var psi = new ProcessStartInfo("vmconnect.exe", "localhost " + QuoteArg(name));
                 psi.UseShellExecute = false;
                 Process.Start(psi);
             }
-            catch { }
+            catch (Exception ex) { LogEx("ConnectVm", ex); }
         }
 
         private static void ConnectAllRunning()
         {
             try
             {
-                foreach (var v in GetVms())
+                var vms = GetVms();
+                if (vms == null) return;
+                foreach (var v in vms)
                     if (v.Running) ConnectVm(v.Name);
             }
-            catch { }
+            catch (Exception ex) { LogEx("ConnectAllRunning", ex); }
         }
 
         private static void StartThread(ThreadStart action)
@@ -757,7 +845,7 @@ namespace HyperVTray
                     sc.Save();
                 }
             }
-            catch { }
+            catch (Exception ex) { LogEx("ToggleAutostart", ex); }
         }
 
         private static void WatchLoop()
@@ -785,8 +873,9 @@ namespace HyperVTray
 
                     Thread.Sleep(Timeout.Infinite);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    LogEx("WatchLoop", ex);
                     Thread.Sleep(10000);
                 }
             }
@@ -795,13 +884,13 @@ namespace HyperVTray
         private static void PostUpdate()
         {
             try { sync.Post(delegate { UpdateStatus(); }, null); }
-            catch { }
+            catch (Exception ex) { LogEx("PostUpdate", ex); }
         }
 
         private static void RaiseUpdate()
         {
             try { debounce.Change(800, Timeout.Infinite); }
-            catch { }
+            catch (Exception ex) { LogEx("RaiseUpdate", ex); }
         }
 
         private static ManagementObject GetVmObject(ManagementScope scope, string guid)
@@ -823,7 +912,7 @@ namespace HyperVTray
                 scope.Connect();
                 RequestState(scope, guid, 2);
             }
-            catch { }
+            catch (Exception ex) { LogEx("StartVm", ex); }
         }
 
         private static void RequestState(ManagementScope scope, string guid, int state)
@@ -838,7 +927,7 @@ namespace HyperVTray
                     mo.InvokeMethod("RequestStateChange", p, null);
                 }
             }
-            catch { }
+            catch (Exception ex) { LogEx("RequestState", ex); }
         }
 
         private static void SaveVm(string guid)
@@ -849,7 +938,7 @@ namespace HyperVTray
                 scope.Connect();
                 RequestSave(scope, guid);
             }
-            catch { }
+            catch (Exception ex) { LogEx("SaveVm", ex); }
         }
 
         private static void RequestSave(ManagementScope scope, string guid)
@@ -865,7 +954,7 @@ namespace HyperVTray
                 scope.Connect();
                 RequestState(scope, guid, 3);
             }
-            catch { }
+            catch (Exception ex) { LogEx("DiscardSavedVm", ex); }
         }
 
         private static void SaveAllVms()
@@ -1012,7 +1101,7 @@ namespace HyperVTray
 
                 ForceOff(scope, guid);
             }
-            catch { }
+            catch (Exception ex) { LogEx("StopVm", ex); }
         }
 
         private static void StopAllVms()
