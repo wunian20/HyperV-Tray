@@ -9,7 +9,7 @@
   - 打开 ExHyperV 管理界面
   - 优雅关闭虚拟机（超时自动强制关闭）
   - 启动虚拟机
-- 虚拟机启动/关闭时弹出气泡通知，通知图标自动使用对应操作系统的图标（读取 VM Notes 的 `[OSType:xxx]` 标签，如 `[OSType:Kali]`；未设置时回退为应用图标）
+- 虚拟机启动/关闭时弹出系统默认气泡通知
 - 支持开机自启（菜单开关，写入启动文件夹快捷方式）
 - 单实例保护（全局 Mutex）
 - 双击图标打开 ExHyperV
@@ -34,9 +34,7 @@
 需要 .NET Framework 4.x（Windows 自带）：
 
 ```powershell
-# 需先执行 os_icons 目录下的 .ico 生成步骤（见 os_icons\BUILD.md）
-$res = Get-ChildItem .\os_icons\*.ico | ForEach-Object { "/resource:" + $_.FullName + ",HyperVTray.OsIcons." + $_.BaseName }
-csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll $res HyperV-Tray.cs
+csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll HyperV-Tray.cs
 ```
 
 ## 文件
@@ -44,4 +42,3 @@ csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /r:Sy
 - `HyperV-Tray.cs` — 源码
 - `HyperV-Tray.exe` — 编译产物
 - `HyperV-Tray.ico` — 应用图标
-- `os_icons/` — 各操作系统托盘图标（`.ico`，编译时作为嵌入资源）
