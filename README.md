@@ -33,9 +33,11 @@
 
 单文件绿色版，无需安装。直接运行 `HyperV-Tray.exe` 即可；如需开机自启，可在托盘右键菜单勾选"开机自启"（写入启动文件夹快捷方式）。
 
+在无 Hyper-V 的环境可用 `HyperV-Tray.exe --test-notify` 发送测试通知（不依赖 Hyper-V，发送后自动退出）。
+
 ## 原理
 
-使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现。
+使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现；保存(6)/恢复(2)/销毁(3)亦通过 `RequestStateChange` 实现。
 
 ## 构建
 
