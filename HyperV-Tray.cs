@@ -66,6 +66,8 @@ namespace HyperVTray
         private static readonly List<UptimeEntry> uptimeEntries = new List<UptimeEntry>();
         private static DateTime menuOpenTime;
         private static readonly Dictionary<string, bool> prevRun = new Dictionary<string, bool>();
+        private static string exHyperVPath;
+        private static DateTime exScanTime;
         private static bool firstSync = true;
 
         [STAThread]
@@ -443,8 +445,63 @@ namespace HyperVTray
 
         private static bool HasExHyperV()
         {
-            try { return File.Exists(ExHyperVPath) || Process.GetProcessesByName("ExHyperV").Length > 0; }
-            catch { return false; }
+            return FindExHyperV() != null;
+        }
+
+        private static string FindExHyperV()
+        {
+            if ((DateTime.Now - exScanTime).TotalSeconds < 30) return exHyperVPath;
+            exScanTime = DateTime.Now;
+            exHyperVPath = null;
+            try
+            {
+                if (File.Exists(ExHyperVPath)) { exHyperVPath = ExHyperVPath; return exHyperVPath; }
+
+                Process[] procs = Process.GetProcessesByName("ExHyperV");
+                if (procs.Length > 0)
+                {
+                    try { exHyperVPath = procs[0].MainModule.FileName; return exHyperVPath; }
+                    catch { }
+                }
+
+                string[] dirs = {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ExHyperV"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "ExHyperV"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "ExHyperV"),
+                    @"C:\ExHyperV"
+                };
+                foreach (string dir in dirs)
+                {
+                    string p = Path.Combine(dir, "ExHyperV.exe");
+                    if (File.Exists(p)) { exHyperVPath = p; return exHyperVPath; }
+                }
+
+                string[] menuRoots = {
+                    Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Microsoft", "Windows", "Start Menu", "Programs")
+                };
+                dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+                foreach (string root in menuRoots)
+                {
+                    if (!Directory.Exists(root)) continue;
+                    foreach (string lnk in Directory.GetFiles(root, "*.lnk", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            dynamic sc = shell.CreateShortcut(lnk);
+                            string target = sc.TargetPath;
+                            if (!string.IsNullOrEmpty(target) && Path.GetFileName(target).Equals("ExHyperV.exe", StringComparison.OrdinalIgnoreCase))
+                            {
+                                exHyperVPath = target;
+                                return exHyperVPath;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return exHyperVPath;
         }
 
         private static void OpenExHyperV()
@@ -461,13 +518,11 @@ namespace HyperVTray
                         SetForegroundWindow(h);
                     }
                 }
-                else if (File.Exists(ExHyperVPath))
-                {
-                    Process.Start(ExHyperVPath);
-                }
                 else
                 {
-                    OpenHyperVManager();
+                    string p = FindExHyperV();
+                    if (p != null) Process.Start(p);
+                    else OpenHyperVManager();
                 }
             }
             catch { OpenHyperVManager(); }
