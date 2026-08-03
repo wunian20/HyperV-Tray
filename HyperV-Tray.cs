@@ -27,6 +27,7 @@ namespace HyperVTray
         public long UpTimeSeconds;
         public int CpuLoad = -1;
         public long MemoryMB;
+        public string OsType = "Windows";
     }
 
     internal static class Program
@@ -36,12 +37,6 @@ namespace HyperVTray
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        [DllImport("shell32.dll", CharSet = CharSet.Auto)]
-        private static extern uint ExtractIconEx(string szFileName, int nIconIndex, out IntPtr phiconLarge, out IntPtr phiconSmall, uint nIcons);
-
-        [DllImport("user32.dll")]
-        private static extern bool DestroyIcon(IntPtr hIcon);
 
         private const int SW_RESTORE = 9;
         private const string ExHyperVPath = @"C:\ExHyperV_V1.5.0_x64\ExHyperV.exe";
@@ -55,6 +50,9 @@ namespace HyperVTray
         private static Mutex mutex;
         private static List<VMInfo> lastVms = new List<VMInfo>();
         private static readonly Dictionary<string, bool> prevRun = new Dictionary<string, bool>();
+        private static readonly Dictionary<string, Icon> osIcons = new Dictionary<string, Icon>();
+        private static System.Windows.Forms.Timer iconRestore;
+        private static Icon baseIcon;
         private static bool firstSync = true;
 
         [STAThread]
@@ -71,11 +69,19 @@ namespace HyperVTray
             SynchronizationContext.SetSynchronizationContext(sync);
 
             tray = new NotifyIcon();
-            tray.Icon = LoadTrayIcon();
+            baseIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            tray.Icon = baseIcon;
             tray.Text = "Hyper-V 监控";
             tray.Visible = true;
             tray.DoubleClick += (s, e) => OpenExHyperV();
             tray.ContextMenuStrip = new ContextMenuStrip();
+
+            iconRestore = new System.Windows.Forms.Timer { Interval = 4000 };
+            iconRestore.Tick += (s, e) =>
+            {
+                iconRestore.Stop();
+                try { tray.Icon = baseIcon; } catch { }
+            };
 
             timer = new System.Windows.Forms.Timer { Interval = 60000 };
             timer.Tick += (s, e) => UpdateStatus();
@@ -142,10 +148,12 @@ namespace HyperVTray
                         if (!prevRun.TryGetValue(kv.Key, out prev)) continue;
                         if (kv.Value && !prev)
                         {
+                            UseOsIcon(FindVm(vms, kv.Key));
                             tray.ShowBalloonTip(2500, "Hyper-V", FindName(vms, kv.Key) + " 已启动", ToolTipIcon.Info);
                         }
                         else if (!kv.Value && prev)
                         {
+                            UseOsIcon(FindVm(vms, kv.Key));
                             tray.ShowBalloonTip(2500, "Hyper-V", FindName(vms, kv.Key) + " 已关闭", ToolTipIcon.Info);
                         }
                     }
@@ -163,6 +171,62 @@ namespace HyperVTray
             foreach (var v in vms)
                 if (v.Guid == guid) return v.Name;
             return guid;
+        }
+
+        private static VMInfo FindVm(List<VMInfo> vms, string guid)
+        {
+            foreach (var v in vms)
+                if (v.Guid == guid) return v;
+            return null;
+        }
+
+        private static void UseOsIcon(VMInfo v)
+        {
+            try
+            {
+                if (v == null) return;
+                Icon icon = GetOsIcon(v.OsType);
+                if (icon != null) tray.Icon = icon;
+                if (iconRestore != null)
+                {
+                    iconRestore.Stop();
+                    iconRestore.Start();
+                }
+            }
+            catch { }
+        }
+
+        private static Icon GetOsIcon(string osType)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(osType)) return null;
+                Icon icon;
+                if (osIcons.TryGetValue(osType, out icon)) return icon;
+                string resName = "HyperVTray.OsIcons." + osType;
+                using (Stream s = typeof(Program).Assembly.GetManifestResourceStream(resName))
+                {
+                    if (s == null) return null;
+                    icon = new Icon(s);
+                    osIcons[osType] = icon;
+                    return icon;
+                }
+            }
+            catch { return null; }
+        }
+
+        private static string ParseOsType(string notes)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(notes)) return "Windows";
+                System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(
+                    notes, @"OSType:([^\]]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (!m.Success) return "Windows";
+                string t = m.Groups[1].Value.Trim();
+                return t.Length == 0 ? "Windows" : t;
+            }
+            catch { return "Windows"; }
         }
 
         private static string JoinNames(List<VMInfo> vms)
@@ -202,6 +266,28 @@ namespace HyperVTray
 
                 foreach (var v in list)
                     if (v.Running) EnrichVmInfo(scope, v);
+
+                var notesMap = new Dictionary<string, string>();
+                var notesQuery = new ObjectQuery("SELECT Name, Notes FROM Msvm_SummaryInformation");
+                using (var searcher = new ManagementObjectSearcher(scope, notesQuery))
+                {
+                    foreach (ManagementObject mo in searcher.Get())
+                    {
+                        try
+                        {
+                            string id = Convert.ToString(mo["Name"]);
+                            string notes = Convert.ToString(mo["Notes"]);
+                            if (!string.IsNullOrEmpty(id)) notesMap[id] = notes;
+                        }
+                        catch { }
+                    }
+                }
+                foreach (var v in list)
+                {
+                    string notes;
+                    if (notesMap.TryGetValue(v.Guid, out notes))
+                        v.OsType = ParseOsType(notes);
+                }
             }
             catch { }
             list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
@@ -326,30 +412,6 @@ namespace HyperVTray
                 Application.Exit();
             };
             menu.Items.Add(exit);
-        }
-
-        private static Icon LoadTrayIcon()
-        {
-            try
-            {
-                if (File.Exists(ExHyperVPath))
-                {
-                    IntPtr large, small;
-                    uint n = ExtractIconEx(ExHyperVPath, 0, out large, out small, 1);
-                    if (n > 0 && large != IntPtr.Zero)
-                    {
-                        Icon result;
-                        using (Icon src = Icon.FromHandle(large))
-                            result = (Icon)src.Clone();
-                        if (small != IntPtr.Zero) DestroyIcon(small);
-                        DestroyIcon(large);
-                        return result;
-                    }
-                    if (small != IntPtr.Zero) DestroyIcon(small);
-                }
-            }
-            catch { }
-            return Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         }
 
         private static void OpenExHyperV()
