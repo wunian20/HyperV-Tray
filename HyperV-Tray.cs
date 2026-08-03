@@ -426,7 +426,11 @@ namespace HyperVTray
             hvHeader.ForeColor = hvEnabled ? Color.Green : Color.Red;
             menu.Items.Add(hvHeader);
 
+            menu.Items.Add(new ToolStripSeparator());
+
             menu.Items.Add(new ToolStripMenuItem("虚拟机") { Enabled = false });
+
+            menu.Items.Add(new ToolStripSeparator());
 
             if (vms.Count == 0)
             {
@@ -500,6 +504,8 @@ namespace HyperVTray
             connectAll.Enabled = hasRunning;
             connectAll.Click += (s, e) => ConnectAllRunning();
             menu.Items.Add(connectAll);
+
+            menu.Items.Add(new ToolStripSeparator());
 
             var refresh = new ToolStripMenuItem("立即刷新");
             refresh.Click += (s, e) => UpdateStatus();
