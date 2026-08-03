@@ -30,7 +30,8 @@ namespace HyperVTray
         public long UpTimeSeconds;
         public int CpuLoad = -1;
         public long MemoryUsedMB;
-        public long MemoryMB;
+        public long MemoryLimitMB;
+        public bool DynamicMemory;
     }
 
     internal sealed class UptimeEntry
@@ -39,6 +40,7 @@ namespace HyperVTray
         public ToolStripItem Detail;
         public long BaseSeconds;
         public long AllocatedMB;
+        public bool DynamicMemory;
     }
 
     internal static class Program
@@ -54,6 +56,8 @@ namespace HyperVTray
         private const string StartupLnk = @"C:\Users\wunian\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\HyperV-Tray.lnk";
 
         private static NotifyIcon tray;
+        private static Icon baseIcon;
+        private static Icon greenIcon;
         private static FormsTimer refresh;
         private static ThreadingTimer debounce;
         private static SynchronizationContext sync;
@@ -78,13 +82,21 @@ namespace HyperVTray
             SynchronizationContext.SetSynchronizationContext(sync);
 
             tray = new NotifyIcon();
-            tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            baseIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            tray.Icon = baseIcon;
             tray.Text = "Hyper-V 监控";
             tray.Visible = true;
             tray.DoubleClick += (s, e) => OpenExHyperV();
             tray.ContextMenuStrip = new ContextMenuStrip();
             tray.ContextMenuStrip.Opening += (s, e) => RefreshMenu();
             tray.ContextMenuStrip.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
+
+            try
+            {
+                using (Stream s = typeof(Program).Assembly.GetManifestResourceStream("HyperVTray.Green"))
+                    if (s != null) greenIcon = new Icon(s);
+            }
+            catch { }
 
             uptimeTick = new ThreadingTimer(delegate { TickUptime(); }, null, Timeout.Infinite, Timeout.Infinite);
 
@@ -108,6 +120,7 @@ namespace HyperVTray
             foreach (var v in vms)
                 if (v.Running) running.Add(v);
 
+            tray.Icon = (running.Count > 0 && greenIcon != null) ? greenIcon : baseIcon;
             tray.Visible = true;
             if (running.Count > 0)
             {
@@ -152,7 +165,7 @@ namespace HyperVTray
                     int cpu = QueryCpu(scope, entries[i].Guid);
                     long used = QueryUsedMem(scope, entries[i].Guid);
                     texts[i] = "CPU " + (cpu >= 0 ? cpu + "%" : "--")
-                        + " | 已使用 " + FmtMem(used) + " / 分配 " + FmtMem(entries[i].AllocatedMB)
+                        + " | " + MemInfo(used, entries[i].AllocatedMB, entries[i].DynamicMemory)
                         + " | 已运行 " + FormatUptime(entries[i].BaseSeconds + nowSec);
                 }
 
@@ -269,13 +282,15 @@ namespace HyperVTray
                 v.CpuLoad = QueryCpu(scope, v.Guid);
                 v.MemoryUsedMB = QueryUsedMem(scope, v.Guid);
 
-                var memQuery = new ObjectQuery("SELECT VirtualQuantity FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
+                var memQuery = new ObjectQuery("SELECT VirtualQuantity, Limit, DynamicMemoryEnabled FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
                 using (var s = new ManagementObjectSearcher(scope, memQuery))
                 {
                     foreach (ManagementObject mo in s.Get())
                     {
-                        object val = mo["VirtualQuantity"];
-                        if (val != null && Convert.ToInt64(val) > v.MemoryMB) v.MemoryMB = Convert.ToInt64(val);
+                        object limit = mo["Limit"];
+                        if (limit != null && Convert.ToInt64(limit) > v.MemoryLimitMB) v.MemoryLimitMB = Convert.ToInt64(limit);
+                        object dm = mo["DynamicMemoryEnabled"];
+                        if (dm != null && Convert.ToBoolean(dm)) v.DynamicMemory = true;
                     }
                 }
             }
@@ -317,12 +332,18 @@ namespace HyperVTray
             return mb > 0 ? (mb / 1024.0).ToString("0.#") + " GB" : "--";
         }
 
+        private static string MemInfo(long used, long max, bool dynamic)
+        {
+            return "已使用 " + FmtMem(used) + " / " + (dynamic ? "最大" : "分配") + " " + FmtMem(max);
+        }
+
         private static void RebuildMenu(List<VMInfo> vms)
         {
             var menu = tray.ContextMenuStrip;
             menu.Items.Clear();
             lock (uptimeEntries) uptimeEntries.Clear();
 
+            bool hasRunning = false;
             menu.Items.Add(new ToolStripMenuItem("虚拟机") { Enabled = false });
 
             if (vms.Count == 0)
@@ -345,9 +366,10 @@ namespace HyperVTray
                         entry.Guid = v.Guid;
                         entry.Detail = new ToolStripMenuItem { Enabled = false };
                         entry.BaseSeconds = v.UpTimeSeconds;
-                        entry.AllocatedMB = v.MemoryMB;
+                        entry.AllocatedMB = v.MemoryLimitMB;
+                        entry.DynamicMemory = v.DynamicMemory;
                         entry.Detail.Text = "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--")
-                            + " | 已使用 " + FmtMem(v.MemoryUsedMB) + " / 分配 " + FmtMem(v.MemoryMB)
+                            + " | " + MemInfo(v.MemoryUsedMB, v.MemoryLimitMB, v.DynamicMemory)
                             + " | 已运行 " + FormatUptime(v.UpTimeSeconds);
                         vmItem.DropDownItems.Add(entry.Detail);
                         lock (uptimeEntries) uptimeEntries.Add(entry);
@@ -359,6 +381,7 @@ namespace HyperVTray
 
                     if (v.Running)
                     {
+                        hasRunning = true;
                         var stop = new ToolStripMenuItem("关闭虚拟机");
                         stop.Click += (s, e) => StartThread(delegate { StopVm(vmGuid); });
                         vmItem.DropDownItems.Add(stop);
@@ -375,6 +398,16 @@ namespace HyperVTray
             }
 
             menu.Items.Add(new ToolStripSeparator());
+
+            var stopAll = new ToolStripMenuItem("关闭全部虚拟机");
+            stopAll.Enabled = hasRunning;
+            stopAll.Click += (s, e) =>
+            {
+                if (MessageBox.Show("确定要关闭所有虚拟机吗？", "Hyper-V 监控",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                    StopAllVms();
+            };
+            menu.Items.Add(stopAll);
 
             var refresh = new ToolStripMenuItem("立即刷新");
             refresh.Click += (s, e) => UpdateStatus();
@@ -528,22 +561,7 @@ namespace HyperVTray
             {
                 var scope = new ManagementScope(@"\\.\root\virtualization\v2");
                 scope.Connect();
-
-                var query = new ObjectQuery("SELECT * FROM Msvm_ShutdownComponent WHERE SystemName='" + guid + "'");
-                using (var searcher = new ManagementObjectSearcher(scope, query))
-                {
-                    foreach (ManagementObject sh in searcher.Get())
-                    {
-                        try
-                        {
-                            var p = sh.GetMethodParameters("InitiateShutdown");
-                            p["Force"] = false;
-                            p["Reason"] = 0;
-                            sh.InvokeMethod("InitiateShutdown", p, null);
-                        }
-                        catch { }
-                    }
-                }
+                GracefulShutdown(scope, guid);
 
                 for (int i = 0; i < 15; i++)
                 {
@@ -551,15 +569,84 @@ namespace HyperVTray
                     if (!IsRunning(scope, guid)) return;
                 }
 
-                using (ManagementObject mo = GetVmObject(scope, guid))
-                {
-                    if (mo == null) return;
-                    var p = mo.GetMethodParameters("RequestStateChange");
-                    p["RequestedState"] = 3;
-                    mo.InvokeMethod("RequestStateChange", p, null);
-                }
+                ForceOff(scope, guid);
             }
             catch { }
+        }
+
+        private static void StopAllVms()
+        {
+            StartThread(delegate
+            {
+                try
+                {
+                    var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                    scope.Connect();
+                    var list = new List<string>();
+                    var q = new ObjectQuery("SELECT Name, ElementName, EnabledState FROM Msvm_ComputerSystem");
+                    using (var s = new ManagementObjectSearcher(scope, q))
+                    {
+                        foreach (ManagementObject mo in s.Get())
+                        {
+                            try
+                            {
+                                string id = Convert.ToString(mo["Name"]);
+                                Guid g;
+                                if (!Guid.TryParse(id, out g)) continue;
+                                if (Convert.ToUInt16(mo["EnabledState"]) == 2) list.Add(id);
+                            }
+                            catch { }
+                        }
+                    }
+                    if (list.Count == 0) return;
+
+                    foreach (string guid in list)
+                        GracefulShutdown(scope, guid);
+
+                    for (int i = 0; i < 15; i++)
+                    {
+                        Thread.Sleep(2000);
+                        bool any = false;
+                        foreach (string guid in list)
+                            if (IsRunning(scope, guid)) { any = true; break; }
+                        if (!any) return;
+                    }
+
+                    foreach (string guid in list)
+                        if (IsRunning(scope, guid)) ForceOff(scope, guid);
+                }
+                catch { }
+            });
+        }
+
+        private static void GracefulShutdown(ManagementScope scope, string guid)
+        {
+            var query = new ObjectQuery("SELECT * FROM Msvm_ShutdownComponent WHERE SystemName='" + guid + "'");
+            using (var searcher = new ManagementObjectSearcher(scope, query))
+            {
+                foreach (ManagementObject sh in searcher.Get())
+                {
+                    try
+                    {
+                        var p = sh.GetMethodParameters("InitiateShutdown");
+                        p["Force"] = false;
+                        p["Reason"] = 0;
+                        sh.InvokeMethod("InitiateShutdown", p, null);
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private static void ForceOff(ManagementScope scope, string guid)
+        {
+            using (ManagementObject mo = GetVmObject(scope, guid))
+            {
+                if (mo == null) return;
+                var p = mo.GetMethodParameters("RequestStateChange");
+                p["RequestedState"] = 3;
+                mo.InvokeMethod("RequestStateChange", p, null);
+            }
         }
 
         private static bool IsRunning(ManagementScope scope, string guid)
