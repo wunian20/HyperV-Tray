@@ -67,7 +67,7 @@ namespace HyperVTray
             tray = new NotifyIcon();
             tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             tray.Text = "Hyper-V 监控";
-            tray.Visible = false;
+            tray.Visible = true;
             tray.DoubleClick += (s, e) => OpenExHyperV();
             tray.ContextMenuStrip = new ContextMenuStrip();
 
@@ -92,20 +92,16 @@ namespace HyperVTray
             foreach (var v in vms)
                 if (v.Running) running.Add(v);
 
+            tray.Visible = true;
             if (running.Count > 0)
             {
-                if (!tray.Visible)
-                {
-                    tray.Visible = true;
-                }
                 string tip = "Hyper-V 运行中: " + JoinNames(running);
                 if (tip.Length > 63) tip = tip.Substring(0, 60) + "...";
                 tray.Text = tip;
             }
-            else if (tray.Visible)
+            else
             {
-                tray.Visible = false;
-                tray.Text = "Hyper-V 监控";
+                tray.Text = "Hyper-V 监控（全部已关闭）";
             }
 
             NotifyTransitions(vms);
