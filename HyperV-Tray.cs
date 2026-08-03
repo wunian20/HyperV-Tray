@@ -375,22 +375,9 @@ namespace HyperVTray
                         lock (uptimeEntries) uptimeEntries.Add(entry);
                     }
 
-                    if (HasExHyperV())
-                    {
-                        var open = new ToolStripMenuItem("打开 ExHyperV 界面");
-                        open.Click += (s, e) => OpenExHyperV();
-                        vmItem.DropDownItems.Add(open);
-                    }
-                    else
-                    {
-                        var open = new ToolStripMenuItem("打开 Hyper-V 管理器");
-                        open.Click += (s, e) => OpenHyperVManager();
-                        vmItem.DropDownItems.Add(open);
-
-                        var connect = new ToolStripMenuItem("连接虚拟机");
-                        connect.Click += (s, e) => ConnectVm(vmName);
-                        vmItem.DropDownItems.Add(connect);
-                    }
+                    var connect = new ToolStripMenuItem("使用 vmconnect 连接");
+                    connect.Click += (s, e) => ConnectVm(vmName);
+                    vmItem.DropDownItems.Add(connect);
 
                     if (v.Running)
                     {
@@ -412,6 +399,10 @@ namespace HyperVTray
 
             menu.Items.Add(new ToolStripSeparator());
 
+            var openMgr = new ToolStripMenuItem(HasExHyperV() ? "打开 ExHyperV 界面" : "打开 Hyper-V 管理器");
+            openMgr.Click += (s, e) => OpenExHyperV();
+            menu.Items.Add(openMgr);
+
             var stopAll = new ToolStripMenuItem("关闭全部虚拟机");
             stopAll.Enabled = hasRunning;
             stopAll.Click += (s, e) =>
@@ -421,6 +412,11 @@ namespace HyperVTray
                     StopAllVms();
             };
             menu.Items.Add(stopAll);
+
+            var connectAll = new ToolStripMenuItem("连接所有运行中的虚拟机");
+            connectAll.Enabled = hasRunning;
+            connectAll.Click += (s, e) => ConnectAllRunning();
+            menu.Items.Add(connectAll);
 
             var refresh = new ToolStripMenuItem("立即刷新");
             refresh.Click += (s, e) => UpdateStatus();
@@ -490,6 +486,16 @@ namespace HyperVTray
                 var psi = new ProcessStartInfo("vmconnect.exe", "localhost \"" + name + "\"");
                 psi.UseShellExecute = false;
                 Process.Start(psi);
+            }
+            catch { }
+        }
+
+        private static void ConnectAllRunning()
+        {
+            try
+            {
+                foreach (var v in GetVms())
+                    if (v.Running) ConnectVm(v.Name);
             }
             catch { }
         }
