@@ -40,11 +40,11 @@
 
 ## 调试
 
-设置环境变量 `HYPERV_TRAY_DEBUG=1` 后运行，程序会把关键异常写入 `%TEMP%\HyperV-Tray.log`（带时间戳与来源标记），用于排查 WMI 查询、虚拟机操作、后台事件订阅等失败原因。正常使用无需开启。
+设置环境变量 `HYPERV_TRAY_DEBUG=1` 后运行，程序会把关键异常写入 `%TEMP%\HyperV-Tray.log`（带时间戳与来源标记），用于排查 WMI 查询、虚拟机操作（含批量操作/关机/状态查询）、后台事件订阅等失败原因。正常使用无需开启。
 
 ## 原理
 
-使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现；保存(6)/恢复(2)/销毁(3)亦通过 `RequestStateChange` 实现。
+使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。运行中虚拟机的 CPU / 内存 / 运行时长通过一次 `Msvm_SummaryInformation` 查询（`ProcessorLoad` / `MemoryUsage` / `UpTime`）批量获取，查询结果带 1.5 秒缓存，右键菜单即时弹出不卡顿。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现；保存(6)/恢复(2)/销毁(3)亦通过 `RequestStateChange` 实现。
 
 ## 构建
 
