@@ -90,6 +90,15 @@ namespace HyperVTray
         [STAThread]
         private static void Main()
         {
+            foreach (string a in Environment.GetCommandLineArgs())
+            {
+                if (a.Equals("--test-notify", StringComparison.OrdinalIgnoreCase))
+                {
+                    RunTestNotify();
+                    return;
+                }
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -133,6 +142,34 @@ namespace HyperVTray
 
             UpdateStatus();
             Application.Run();
+        }
+
+        private static void RunTestNotify()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            try
+            {
+                using (var n = new NotifyIcon())
+                {
+                    n.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                    n.Visible = true;
+                    n.ShowBalloonTip(3000, "Hyper-V 监控",
+                        "测试通知：即使未启用 Hyper-V 服务也能正常收到", ToolTipIcon.None);
+
+                    var t = new System.Windows.Forms.Timer();
+                    t.Interval = 5000;
+                    t.Tick += (s, e) =>
+                    {
+                        t.Stop();
+                        n.Visible = false;
+                        Application.Exit();
+                    };
+                    t.Start();
+                    Application.Run();
+                }
+            }
+            catch { }
         }
 
         private static void UpdateStatus()
