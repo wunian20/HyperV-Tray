@@ -6,6 +6,7 @@ using System.IO;
 using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -346,6 +347,11 @@ namespace HyperVTray
             lock (uptimeEntries) uptimeEntries.Clear();
 
             bool hasRunning = false;
+            bool hvEnabled = IsHyperVServiceRunning();
+            var hvHeader = new ToolStripMenuItem(hvEnabled ? "已启用 Hyper-V 服务" : "未启用 Hyper-V 服务") { Enabled = false };
+            if (hvEnabled) hvHeader.ForeColor = Color.Green;
+            menu.Items.Add(hvHeader);
+
             menu.Items.Add(new ToolStripMenuItem("虚拟机") { Enabled = false });
 
             if (vms.Count == 0)
@@ -446,6 +452,16 @@ namespace HyperVTray
         private static bool HasExHyperV()
         {
             return FindExHyperV() != null;
+        }
+
+        private static bool IsHyperVServiceRunning()
+        {
+            try
+            {
+                using (var sc = new ServiceController("vmms"))
+                    return sc.Status == ServiceControllerStatus.Running;
+            }
+            catch { return false; }
         }
 
         private static string FindExHyperV()
