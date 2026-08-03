@@ -4,22 +4,25 @@
 
 ## 功能
 
-- 托盘图标常驻，悬停可查看正在运行的虚拟机及全部关闭状态
-- 右键菜单列出所有虚拟机，支持：
-  - 打开 ExHyperV 管理界面
-  - 优雅关闭虚拟机（超时自动强制关闭）
-  - 启动虚拟机
+- 托盘图标常驻，按状态变色：有虚拟机运行显示**绿色**，全部关闭显示**蓝色**
+- 悬停可查看正在运行的虚拟机及全部关闭状态
+- 右键菜单列出所有虚拟机，实时显示运行中虚拟机的 CPU、已使用/分配（动态内存显示"最大"）内存、运行时长，每秒自动刷新
+- 每台虚拟机支持：
+  - 使用 vmconnect 连接
+  - 启动 / 优雅关闭虚拟机（超时自动强制关闭）
+- 关闭全部虚拟机（带确认弹窗）
+- 连接所有运行中的虚拟机
 - 虚拟机启动/关闭时弹出系统默认气泡通知
+- 打开 ExHyperV 管理界面（存在时联动）；不存在时自动回退到系统 Hyper-V 管理器
 - 支持开机自启（菜单开关，写入启动文件夹快捷方式）
 - 单实例保护（全局 Mutex）
-- 双击图标打开 ExHyperV
 - 基于 WMI 事件订阅实时响应，空闲时零轮询、零 CPU 开销；另有 60 秒兜底刷新防止漏报
 
 ## 依赖
 
 - Windows + Hyper-V 功能
 - 当前用户具备 Hyper-V 管理员权限
-- [ExHyperV](https://github.com/Justsenger/ExHyperV)（点击联动打开的管理界面）
+- [ExHyperV](https://github.com/Justsenger/ExHyperV)（可选：存在时自动扫描并联动打开，不存在时回退系统 Hyper-V 管理器）
 
 ## 使用
 
@@ -34,11 +37,12 @@
 需要 .NET Framework 4.x（Windows 自带）：
 
 ```powershell
-csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll HyperV-Tray.cs
+csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /resource:green.ico,HyperVTray.Green /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll HyperV-Tray.cs
 ```
 
 ## 文件
 
 - `HyperV-Tray.cs` — 源码
 - `HyperV-Tray.exe` — 编译产物
-- `HyperV-Tray.ico` — 应用图标
+- `HyperV-Tray.ico` — 应用图标（蓝色版）
+- `green.ico` — 运行状态图标（绿色版，编译时嵌入）
