@@ -15,7 +15,7 @@ using ThreadingTimer = System.Threading.Timer;
 
 [assembly: AssemblyTitle("Hyper-V 托盘监控")]
 [assembly: AssemblyProduct("Hyper-V 托盘监控")]
-[assembly: AssemblyDescription("监视运行中的 Hyper-V 虚拟机，一键打开 ExHyperV 管理界面")]
+[assembly: AssemblyDescription("监视运行中的 Hyper-V 虚拟机，托盘菜单一键管理")]
 [assembly: AssemblyCompany("wunian")]
 [assembly: AssemblyCopyright("Copyright © 2026 wunian")]
 [assembly: AssemblyVersion("1.0.0.0")]
@@ -66,9 +66,9 @@ namespace HyperVTray
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
-        private const int SW_RESTORE = 9;
+        private const uint WM_NULL = 0x0000;
 
         private static readonly bool debugLog = string.Equals(
             Environment.GetEnvironmentVariable("HYPERV_TRAY_DEBUG"), "1", StringComparison.OrdinalIgnoreCase);
@@ -76,6 +76,8 @@ namespace HyperVTray
             Environment.GetFolderPath(Environment.SpecialFolder.Startup), "HyperV-Tray.lnk");
 
         private static NotifyIcon tray;
+        private static ContextMenuStrip trayMenu;
+        private static AnchorWindow anchorWindow;
         private static Icon baseIcon;
         private static Icon greenIcon;
         private static Icon yellowIcon;
@@ -93,8 +95,6 @@ namespace HyperVTray
         private static volatile bool forceRefresh;
         private static readonly object cacheLock = new object();
         private static ManagementScope wmiScope;
-        private static string exHyperVPath;
-        private static DateTime exScanTime;
         private static bool firstSync = true;
         private static List<VMInfo> cachedVms;
         private static DateTime cacheTime = DateTime.MinValue;
@@ -156,12 +156,19 @@ namespace HyperVTray
             tray.Icon = baseIcon;
             tray.Text = "Hyper-V 监控";
             tray.Visible = true;
-            tray.DoubleClick += (s, e) => OpenExHyperV();
-            tray.ContextMenuStrip = new ContextMenuStrip();
-            tray.ContextMenuStrip.Renderer = new StatusRenderer();
-            tray.ContextMenuStrip.Opening += (s, e) => RefreshMenu();
-            tray.ContextMenuStrip.Opened += (s, e) => AdjustMenuBounds();
-            tray.ContextMenuStrip.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
+            trayMenu = new ContextMenuStrip();
+            trayMenu.Renderer = new StatusRenderer();
+            trayMenu.Opening += (s, e) => RefreshMenu();
+            trayMenu.Opened += (s, e) => AdjustMenuBounds();
+            trayMenu.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
+            tray.MouseUp += (s, e) =>
+            {
+                // 左右键均弹出菜单；显示前激活隐藏窗口，否则菜单失焦不自动关闭
+                if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
+                    ShowTrayMenu();
+            };
+            anchorWindow = new AnchorWindow();
+            anchorWindow.CreateHandle(new CreateParams { Caption = "HyperV-Tray" });
 
             try
             {
@@ -261,6 +268,19 @@ namespace HyperVTray
             NotifyTransitions(vms);
         }
 
+        private static void ShowTrayMenu()
+        {
+            try
+            {
+                // 先激活隐藏窗口再显示菜单：ToolStripDropDown 依赖焦点实现失焦自动关闭，
+                // 托盘程序没有主窗口，直接 Show 会导致点击菜单外部无法关闭
+                SetForegroundWindow(anchorWindow.Handle);
+                trayMenu.Show(Cursor.Position);
+                PostMessage(anchorWindow.Handle, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+            }
+            catch (Exception ex) { LogEx("ShowTrayMenu", ex); }
+        }
+
         private static void RefreshMenu()
         {
             List<VMInfo> vms = GetVms();
@@ -273,7 +293,7 @@ namespace HyperVTray
         {
             try
             {
-                var menu = tray.ContextMenuStrip;
+                var menu = trayMenu;
                 var wa = Screen.FromPoint(menu.Location).WorkingArea;
                 int x = menu.Left, y = menu.Top;
                 if (menu.Right > wa.Right) x = wa.Right - menu.Width;
@@ -535,7 +555,7 @@ namespace HyperVTray
 
         private static bool RebuildMenu(List<VMInfo> vms)
         {
-            var menu = tray.ContextMenuStrip;
+            var menu = trayMenu;
             menu.Items.Clear();
             lock (uptimeEntries) uptimeEntries.Clear();
 
@@ -568,7 +588,6 @@ namespace HyperVTray
                     string vmGuid = v.Guid;
 
                     var vmItem = new ToolStripMenuItem(vmName + "  [" + StateText(v) + "]");
-                    vmItem.Click += (s, e) => OpenExHyperV();
 
                     if (v.Running)
                     {
@@ -636,11 +655,6 @@ namespace HyperVTray
 
             menu.Items.Add(new ToolStripSeparator());
 
-            var openMgr = new ToolStripMenuItem(HasExHyperV() ? "打开 ExHyperV 界面" : "打开 Hyper-V 管理器");
-            openMgr.Enabled = hvEnabled;
-            openMgr.Click += (s, e) => OpenExHyperV();
-            menu.Items.Add(openMgr);
-
             var stopAll = new ToolStripMenuItem("关闭全部虚拟机");
             stopAll.Enabled = hasRunning;
             stopAll.Click += (s, e) =>
@@ -705,11 +719,6 @@ namespace HyperVTray
             return hasRunning;
         }
 
-        private static bool HasExHyperV()
-        {
-            return FindExHyperV() != null;
-        }
-
         private static bool IsHyperVServiceRunning()
         {
             try
@@ -718,101 +727,6 @@ namespace HyperVTray
                     return sc.Status == ServiceControllerStatus.Running;
             }
             catch (Exception ex) { LogEx("IsHyperVServiceRunning", ex); return false; }
-        }
-
-        private static string FindExHyperV()
-        {
-            if ((DateTime.Now - exScanTime).TotalSeconds < 30) return exHyperVPath;
-            exScanTime = DateTime.Now;
-            exHyperVPath = null;
-            try
-            {
-                Process[] procs = Process.GetProcessesByName("ExHyperV");
-                if (procs.Length > 0)
-                {
-                    try { exHyperVPath = procs[0].MainModule.FileName; return exHyperVPath; }
-                    catch (Exception ex) { LogEx("FindExHyperV.Proc", ex); }
-                }
-
-                string[] dirs = {
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ExHyperV"),
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "ExHyperV"),
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "ExHyperV"),
-                    @"C:\ExHyperV"
-                };
-                foreach (string dir in dirs)
-                {
-                    string p = Path.Combine(dir, "ExHyperV.exe");
-                    if (File.Exists(p)) { exHyperVPath = p; return exHyperVPath; }
-                }
-
-                // 兜底：扫描 C:\ 根目录下所有 ExHyperV* 目录（兼容带版本号的安装目录，如 C:\ExHyperV_V1.5.0_x64）
-                try
-                {
-                    foreach (string d in Directory.GetDirectories(@"C:\", "ExHyperV*"))
-                    {
-                        string p = Path.Combine(d, "ExHyperV.exe");
-                        if (File.Exists(p)) { exHyperVPath = p; return exHyperVPath; }
-                    }
-                }
-                catch (Exception ex) { LogEx("FindExHyperV.ScanRoot", ex); }
-
-                string[] menuRoots = {
-                    Environment.GetFolderPath(Environment.SpecialFolder.Programs),
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Microsoft", "Windows", "Start Menu", "Programs")
-                };
-                dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
-                foreach (string root in menuRoots)
-                {
-                    if (!Directory.Exists(root)) continue;
-                    foreach (string lnk in Directory.GetFiles(root, "*.lnk", SearchOption.AllDirectories))
-                    {
-                        try
-                        {
-                            dynamic sc = shell.CreateShortcut(lnk);
-                            string target = sc.TargetPath;
-                            if (!string.IsNullOrEmpty(target) && Path.GetFileName(target).Equals("ExHyperV.exe", StringComparison.OrdinalIgnoreCase))
-                            {
-                                exHyperVPath = target;
-                                return exHyperVPath;
-                            }
-                        }
-                        catch (Exception ex) { LogEx("FindExHyperV.Lnk", ex); }
-                    }
-                }
-            }
-            catch (Exception ex) { LogEx("FindExHyperV", ex); }
-            return exHyperVPath;
-        }
-
-        private static void OpenExHyperV()
-        {
-            try
-            {
-                Process[] procs = Process.GetProcessesByName("ExHyperV");
-                if (procs.Length > 0)
-                {
-                    IntPtr h = procs[0].MainWindowHandle;
-                    if (h != IntPtr.Zero)
-                    {
-                        ShowWindow(h, SW_RESTORE);
-                        SetForegroundWindow(h);
-                    }
-                }
-                else
-                {
-                    string p = FindExHyperV();
-                    if (p != null) Process.Start(p);
-                    else OpenHyperVManager();
-                }
-            }
-            catch (Exception ex) { LogEx("OpenExHyperV", ex); OpenHyperVManager(); }
-        }
-
-        private static void OpenHyperVManager()
-        {
-            try { Process.Start("virtmgmt.msc"); }
-            catch (Exception ex) { LogEx("OpenHyperVManager", ex); }
         }
 
         private static string QuoteArg(string arg)
@@ -1218,6 +1132,11 @@ namespace HyperVTray
                 }
             }
             catch (Exception ex) { LogEx("GetStateCode", ex); return -1; }
+        }
+
+        // 用于激活菜单的隐藏窗口（仅需句柄，无需处理消息）
+        private sealed class AnchorWindow : NativeWindow
+        {
         }
     }
 }
