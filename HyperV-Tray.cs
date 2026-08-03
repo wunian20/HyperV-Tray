@@ -32,6 +32,14 @@ namespace HyperVTray
         public long MemoryMB;
     }
 
+    internal sealed class UptimeEntry
+    {
+        public string Guid;
+        public ToolStripItem Detail;
+        public long BaseSeconds;
+        public string MemText;
+    }
+
     internal static class Program
     {
         [DllImport("user32.dll")]
@@ -49,7 +57,9 @@ namespace HyperVTray
         private static ThreadingTimer debounce;
         private static SynchronizationContext sync;
         private static Mutex mutex;
-        private static string lastSig = "";
+        private static ThreadingTimer uptimeTick;
+        private static readonly List<UptimeEntry> uptimeEntries = new List<UptimeEntry>();
+        private static DateTime menuOpenTime;
         private static readonly Dictionary<string, bool> prevRun = new Dictionary<string, bool>();
         private static bool firstSync = true;
 
@@ -72,6 +82,10 @@ namespace HyperVTray
             tray.Visible = true;
             tray.DoubleClick += (s, e) => OpenExHyperV();
             tray.ContextMenuStrip = new ContextMenuStrip();
+            tray.ContextMenuStrip.Opening += (s, e) => RefreshMenu();
+            tray.ContextMenuStrip.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
+
+            uptimeTick = new ThreadingTimer(delegate { TickUptime(); }, null, Timeout.Infinite, Timeout.Infinite);
 
             refresh = new FormsTimer { Interval = 60000 };
             refresh.Tick += (s, e) => UpdateStatus();
@@ -106,15 +120,56 @@ namespace HyperVTray
             }
 
             NotifyTransitions(vms);
+        }
 
-            string sig = "";
+        private static void RefreshMenu()
+        {
+            List<VMInfo> vms = GetVms();
+            RebuildMenu(vms);
+            menuOpenTime = DateTime.Now;
+            bool hasRunning = false;
             foreach (var v in vms)
-                sig += v.Name + ":" + (v.Running ? "1" : "0") + "|";
-            if (sig != lastSig)
+                if (v.Running) { hasRunning = true; break; }
+            uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
+        }
+
+        private static void TickUptime()
+        {
+            try
             {
-                lastSig = sig;
-                RebuildMenu(vms);
+                UptimeEntry[] entries;
+                lock (uptimeEntries) entries = uptimeEntries.ToArray();
+                if (entries.Length == 0) return;
+
+                var scope = new ManagementScope(@"\\.\root\virtualization\v2");
+                scope.Connect();
+                long nowSec = (long)(DateTime.Now - menuOpenTime).TotalSeconds;
+
+                var texts = new string[entries.Length];
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    int cpu = QueryCpu(scope, entries[i].Guid);
+                    texts[i] = "CPU " + (cpu >= 0 ? cpu + "%" : "--")
+                        + " | 内存 " + entries[i].MemText
+                        + " | 已运行 " + FormatUptime(entries[i].BaseSeconds + nowSec);
+                }
+
+                sync.Post(delegate
+                {
+                    try
+                    {
+                        for (int i = 0; i < entries.Length; i++)
+                            entries[i].Detail.Text = texts[i];
+                    }
+                    catch { }
+                }, null);
             }
+            catch { }
+        }
+
+        private static string FormatUptime(long sec)
+        {
+            return string.Format("{0:D2}:{1:D2}:{2:D2}", sec / 3600, (sec / 60) % 60, sec % 60);
         }
 
         private static void NotifyTransitions(List<VMInfo> vms)
@@ -209,17 +264,7 @@ namespace HyperVTray
         {
             try
             {
-                long total = 0, count = 0;
-                var cpuQuery = new ObjectQuery("SELECT LoadPercentage FROM Msvm_Processor WHERE SystemName='" + v.Guid + "'");
-                using (var s = new ManagementObjectSearcher(scope, cpuQuery))
-                {
-                    foreach (ManagementObject mo in s.Get())
-                    {
-                        object val = mo["LoadPercentage"];
-                        if (val != null) { total += Convert.ToInt64(val); count++; }
-                    }
-                }
-                if (count > 0) v.CpuLoad = (int)(total / count);
+                v.CpuLoad = QueryCpu(scope, v.Guid);
 
                 var memQuery = new ObjectQuery("SELECT VirtualQuantity FROM Msvm_MemorySettingData WHERE InstanceID LIKE '%" + v.Guid + "%'");
                 using (var s = new ManagementObjectSearcher(scope, memQuery))
@@ -234,10 +279,26 @@ namespace HyperVTray
             catch { }
         }
 
+        private static int QueryCpu(ManagementScope scope, string guid)
+        {
+            long total = 0, count = 0;
+            var q = new ObjectQuery("SELECT LoadPercentage FROM Msvm_Processor WHERE SystemName='" + guid + "'");
+            using (var s = new ManagementObjectSearcher(scope, q))
+            {
+                foreach (ManagementObject mo in s.Get())
+                {
+                    object val = mo["LoadPercentage"];
+                    if (val != null) { total += Convert.ToInt64(val); count++; }
+                }
+            }
+            return count > 0 ? (int)(total / count) : -1;
+        }
+
         private static void RebuildMenu(List<VMInfo> vms)
         {
             var menu = tray.ContextMenuStrip;
             menu.Items.Clear();
+            lock (uptimeEntries) uptimeEntries.Clear();
 
             menu.Items.Add(new ToolStripMenuItem("虚拟机") { Enabled = false });
 
@@ -257,11 +318,16 @@ namespace HyperVTray
 
                     if (v.Running)
                     {
-                        string detail = "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--");
-                        detail += " | 内存 " + (v.MemoryMB > 0 ? (v.MemoryMB / 1024.0).ToString("0.#") + " GB" : "--");
-                        long sec = v.UpTimeSeconds;
-                        detail += " | 已运行 " + string.Format("{0:D2}:{1:D2}:{2:D2}", sec / 3600, (sec / 60) % 60, sec % 60);
-                        vmItem.DropDownItems.Add(new ToolStripMenuItem(detail) { Enabled = false });
+                        var entry = new UptimeEntry();
+                        entry.Guid = v.Guid;
+                        entry.Detail = new ToolStripMenuItem { Enabled = false };
+                        entry.BaseSeconds = v.UpTimeSeconds;
+                        entry.MemText = v.MemoryMB > 0 ? (v.MemoryMB / 1024.0).ToString("0.#") + " GB" : "--";
+                        entry.Detail.Text = "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--")
+                            + " | 内存 " + entry.MemText
+                            + " | 已运行 " + FormatUptime(v.UpTimeSeconds);
+                        vmItem.DropDownItems.Add(entry.Detail);
+                        lock (uptimeEntries) uptimeEntries.Add(entry);
                     }
 
                     var open = new ToolStripMenuItem("打开 ExHyperV 界面");
