@@ -44,6 +44,21 @@ namespace HyperVTray
         public bool DynamicMemory;
     }
 
+    internal sealed class StatusRenderer : ToolStripProfessionalRenderer
+    {
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            if (!e.Item.Enabled && e.Item.ForeColor != SystemColors.ControlText)
+            {
+                TextRenderer.DrawText(e.Graphics, e.Item.Text, e.Item.Font,
+                    e.TextRectangle, e.Item.ForeColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                return;
+            }
+            base.OnRenderItemText(e);
+        }
+    }
+
     internal static class Program
     {
         [DllImport("user32.dll")]
@@ -91,6 +106,7 @@ namespace HyperVTray
             tray.Visible = true;
             tray.DoubleClick += (s, e) => OpenExHyperV();
             tray.ContextMenuStrip = new ContextMenuStrip();
+            tray.ContextMenuStrip.Renderer = new StatusRenderer();
             tray.ContextMenuStrip.Opening += (s, e) => RefreshMenu();
             tray.ContextMenuStrip.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
 
@@ -349,7 +365,7 @@ namespace HyperVTray
             bool hasRunning = false;
             bool hvEnabled = IsHyperVServiceRunning();
             var hvHeader = new ToolStripMenuItem(hvEnabled ? "已启用 Hyper-V 服务" : "未启用 Hyper-V 服务") { Enabled = false };
-            if (hvEnabled) hvHeader.ForeColor = Color.Green;
+            hvHeader.ForeColor = hvEnabled ? Color.Green : Color.Red;
             menu.Items.Add(hvHeader);
 
             menu.Items.Add(new ToolStripMenuItem("虚拟机") { Enabled = false });
