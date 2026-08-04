@@ -73,6 +73,13 @@ namespace HyperVTray
         [DllImport("user32.dll")]
         private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiAwarenessContext);
+
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2（Win10 1703+）：高 DPI 下按原生分辨率渲染，
+        // 避免菜单/托盘图标被系统位图拉伸导致模糊
+        private static readonly IntPtr DpiContextPerMonitorV2 = new IntPtr(-4);
+
         [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
         private static extern int SetPreferredAppMode(int appMode);
 
@@ -175,6 +182,14 @@ namespace HyperVTray
             catch { }
         }
 
+        private static void TryEnableDpiAwareness()
+        {
+            // 必须在创建任何窗口或设置 DPI awareness 之前调用，否则返回 false；
+            // 旧系统无此导出时抛 EntryPointNotFoundException，忽略即可（保持原渲染行为）
+            try { SetProcessDpiAwarenessContext(DpiContextPerMonitorV2); }
+            catch (Exception ex) { LogEx("DpiAwareness", ex); }
+        }
+
         private static void TryEnableDarkMode()
         {
             // SetPreferredAppMode 需在创建任何窗口前调用；Win10 1809 之前不存在该导出，失败则忽略
@@ -185,6 +200,7 @@ namespace HyperVTray
         [STAThread]
         private static void Main()
         {
+            TryEnableDpiAwareness();   // 最优先：任何窗口/控件创建前声明 PerMonitorV2，高 DPI 下不模糊
             foreach (string a in Environment.GetCommandLineArgs())
             {
                 if (a.Equals("--test-notify", StringComparison.OrdinalIgnoreCase))
