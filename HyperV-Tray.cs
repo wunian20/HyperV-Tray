@@ -102,7 +102,8 @@ namespace HyperVTray
 
         // 菜单 ID 规划：仿照 HyperVTray 的 idmBase + i*16 + op 编码。
         // 全局命令用低位 ID（1..8，0 保留表示取消），VM 区从 0x0100 起每台占 16 槽，
-        // 最多 4095 台，永不与全局 ID 冲突（避免 VM 数量多时静默撞 ID 误触发批量操作）。
+        // 菜单项 ID 底层是 16 位 WORD，故最多 4080 台，永不与全局 ID 冲突
+        // （避免 VM 数量多时静默撞 ID 误触发批量操作）。
         private const uint IDM_FIRSTVM = 0x0100;
         private const uint VM_SLOT = 16;
         private const uint IDM_DETAIL = 15;      // 详情行占该 VM 槽的第 15 位（非命令，仅用于 ModifyMenuW 定位）
@@ -655,8 +656,15 @@ namespace HyperVTray
                 {
                     for (int i = 0; i < vms.Count; i++)
                     {
-                        VMInfo v = vms[i];
                         uint idmBase = IDM_FIRSTVM + (uint)i * VM_SLOT;
+                        // 菜单项 ID 底层为 16 位 WORD：i ≥ 4080 时 idmBase 回绕为 0 会撞上全局命令 ID，直接截断
+                        if (idmBase + VM_SLOT > 0x10000)
+                        {
+                            Log("BuildMenu: VM 数量超过上限，菜单已截断");
+                            break;
+                        }
+
+                        VMInfo v = vms[i];
                         string label = EscapeAmp(v.Name + "  [" + StateText(v) + "]");
 
                         IntPtr hsub = CreatePopupMenu();
@@ -705,7 +713,11 @@ namespace HyperVTray
                         // 过渡状态（启动中/停止中/暂停中）及未知状态：仅提供连接，避免误操作
 
                         if (!AppendMenuW(hmenu, MF_POPUP, new UIntPtr((ulong)hsub.ToInt64()), label))
+                        {
+                            // 挂载失败：销毁子菜单并同步移除已登记的详情行条目，避免刷新时操作悬垂句柄
+                            lock (uptimeEntries) uptimeEntries.RemoveAll(e => e.SubMenu == hsub);
                             DestroyMenu(hsub);
+                        }
                     }
                 }
 
