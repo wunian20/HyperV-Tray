@@ -1013,6 +1013,20 @@ namespace HyperVTray
             catch (Exception ex) { LogEx("DiscardSavedVm", ex); }
         }
 
+        // 批量操作收尾（UI 线程执行）：先同步状态基准、再关闭抑制、最后弹汇总。
+        // 若先关抑制，批量结束后迟到的状态事件会把 prevRun 里的旧状态当成刚变化，误弹单 VM 通知
+        private static void FinishBatch(string text, List<string> guids, int finalState)
+        {
+            try
+            {
+                foreach (string guid in guids)
+                    prevRun[guid] = finalState;
+                suppressNotify = false;
+                ShowBalloonText(text);
+            }
+            catch (Exception ex) { LogEx("FinishBatch", ex); }
+        }
+
         private static void SaveAllVms()
         {
             suppressNotify = true;
@@ -1022,7 +1036,7 @@ namespace HyperVTray
                 {
                     var scope = GetScope();
                     var list = GetVmsByState(scope, 2);
-                    if (list.Count == 0) return;
+                    if (list.Count == 0) { suppressNotify = false; return; }
 
                     foreach (string guid in list)
                         RequestSave(scope, guid);
@@ -1036,10 +1050,13 @@ namespace HyperVTray
                         if (!anyNotSaved) break;
                     }
 
-                    sync.Post(delegate { ShowBalloonText("已保存全部虚拟机"); }, null);
+                    sync.Post(delegate { FinishBatch("已保存全部虚拟机", list, 6); }, null);
                 }
-                catch (Exception ex) { LogEx("SaveAllVms", ex); }
-                finally { suppressNotify = false; }
+                catch (Exception ex)
+                {
+                    LogEx("SaveAllVms", ex);
+                    sync.Post(delegate { suppressNotify = false; }, null);
+                }
             });
         }
 
@@ -1099,7 +1116,7 @@ namespace HyperVTray
                 {
                     var scope = GetScope();
                     var list = GetVmsByState(scope, 6);
-                    if (list.Count == 0) return;
+                    if (list.Count == 0) { suppressNotify = false; return; }
 
                     foreach (string guid in list)
                         RequestState(scope, guid, 2);
@@ -1113,10 +1130,13 @@ namespace HyperVTray
                         if (!anyNotRunning) break;
                     }
 
-                    sync.Post(delegate { ShowBalloonText("已恢复所有虚拟机"); }, null);
+                    sync.Post(delegate { FinishBatch("已恢复所有虚拟机", list, 2); }, null);
                 }
-                catch (Exception ex) { LogEx("RestoreAllSaved", ex); }
-                finally { suppressNotify = false; }
+                catch (Exception ex)
+                {
+                    LogEx("RestoreAllSaved", ex);
+                    sync.Post(delegate { suppressNotify = false; }, null);
+                }
             });
         }
 
@@ -1129,7 +1149,7 @@ namespace HyperVTray
                 {
                     var scope = GetScope();
                     var list = GetVmsByState(scope, 6);
-                    if (list.Count == 0) return;
+                    if (list.Count == 0) { suppressNotify = false; return; }
 
                     foreach (string guid in list)
                         RequestState(scope, guid, 3);
@@ -1143,10 +1163,13 @@ namespace HyperVTray
                         if (!anyStill) break;
                     }
 
-                    sync.Post(delegate { ShowBalloonText("已销毁全部保存虚拟机"); }, null);
+                    sync.Post(delegate { FinishBatch("已销毁全部保存虚拟机", list, 3); }, null);
                 }
-                catch (Exception ex) { LogEx("DiscardAllSaved", ex); }
-                finally { suppressNotify = false; }
+                catch (Exception ex)
+                {
+                    LogEx("DiscardAllSaved", ex);
+                    sync.Post(delegate { suppressNotify = false; }, null);
+                }
             });
         }
 
@@ -1177,7 +1200,7 @@ namespace HyperVTray
                 {
                     var scope = GetScope();
                     var list = GetVmsByState(scope, 2);
-                    if (list.Count == 0) return;
+                    if (list.Count == 0) { suppressNotify = false; return; }
 
                     foreach (string guid in list)
                         GracefulShutdown(scope, guid);
@@ -1194,10 +1217,13 @@ namespace HyperVTray
                     foreach (string guid in list)
                         if (IsRunning(scope, guid)) ForceOff(scope, guid);
 
-                    sync.Post(delegate { ShowBalloonText("已关闭所有虚拟机"); }, null);
+                    sync.Post(delegate { FinishBatch("已关闭所有虚拟机", list, 3); }, null);
                 }
-                catch (Exception ex) { LogEx("StopAllVms", ex); }
-                finally { suppressNotify = false; }
+                catch (Exception ex)
+                {
+                    LogEx("StopAllVms", ex);
+                    sync.Post(delegate { suppressNotify = false; }, null);
+                }
             });
         }
 
