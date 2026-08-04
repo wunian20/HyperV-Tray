@@ -51,7 +51,7 @@
 需要 .NET Framework 4.x（Windows 自带）：
 
 ```powershell
-csc /nologo /target:winexe /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /resource:green.ico,HyperVTray.Green /resource:yellow.ico,HyperVTray.Yellow /resource:red.ico,HyperVTray.Red /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /r:System.ServiceProcess.dll HyperV-Tray.cs
+csc /nologo /target:winexe /optimize+ /win32icon:HyperV-Tray.ico /out:HyperV-Tray.exe /resource:green.ico,HyperVTray.Green /resource:yellow.ico,HyperVTray.Yellow /resource:red.ico,HyperVTray.Red /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /r:System.ServiceProcess.dll HyperV-Tray.cs
 ```
 
 ## 文件
