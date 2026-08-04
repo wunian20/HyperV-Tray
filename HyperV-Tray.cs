@@ -39,36 +39,86 @@ namespace HyperVTray
     internal sealed class UptimeEntry
     {
         public string Guid;
-        public ToolStripItem Detail;
+        public IntPtr SubMenu;      // 所属 VM 子菜单句柄（用于每秒刷新详情行文本）
+        public uint DetailId;       // 详情行菜单项 ID
         public long BaseSeconds;
         public long AllocatedMB;
         public bool DynamicMemory;
     }
 
-    internal sealed class StatusRenderer : ToolStripProfessionalRenderer
-    {
-        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
-        {
-            if (!e.Item.Enabled && e.Item.ForeColor != SystemColors.ControlText)
-            {
-                TextRenderer.DrawText(e.Graphics, e.Item.Text, e.Item.Font,
-                    e.TextRectangle, e.Item.ForeColor,
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-                return;
-            }
-            base.OnRenderItemText(e);
-        }
-    }
-
     internal static class Program
     {
+        // ---- Win32 原生菜单 P/Invoke（复刻 chrisant996/HyperVTray 的原生弹出菜单）----
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreatePopupMenu();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool AppendMenuW(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, string lpNewItem);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool DestroyMenu(IntPtr hMenu);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool ModifyMenuW(IntPtr hMnu, uint uPosition, uint uFlags, UIntPtr uIDNewItem, string lpNewItem);
+
+        [DllImport("user32.dll")]
+        private static extern uint TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
+        private static extern int SetPreferredAppMode(int appMode);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        // 菜单项标志（WinUser.h MF_*）
+        private const uint MF_STRING = 0x0000;
+        private const uint MF_POPUP = 0x0010;
+        private const uint MF_SEPARATOR = 0x0800;
+        private const uint MF_DISABLED = 0x0002;
+        private const uint MF_GRAYED = 0x0001;
+        private const uint MF_CHECKED = 0x0008;
+        private const uint MF_BYCOMMAND = 0x0000;
+
+        // TrackPopupMenu 标志（TPM_*）
+        private const uint TPM_LEFTALIGN = 0x0000;
+        private const uint TPM_RIGHTBUTTON = 0x0002;
+        private const uint TPM_NONOTIFY = 0x0080;
+        private const uint TPM_RETURNCMD = 0x0100;
+
         private const uint WM_NULL = 0x0000;
+
+        // 菜单 ID 规划：仿照 HyperVTray 的 idmBase + i*16 + op 编码。
+        // 全局命令用低位 ID（1..8，0 保留表示取消），VM 区从 0x0100 起每台占 16 槽，
+        // 最多 4095 台，永不与全局 ID 冲突（避免 VM 数量多时静默撞 ID 误触发批量操作）。
+        private const uint IDM_FIRSTVM = 0x0100;
+        private const uint VM_SLOT = 16;
+        private const uint IDM_DETAIL = 15;      // 详情行占该 VM 槽的第 15 位（非命令，仅用于 ModifyMenuW 定位）
+        private const uint OP_CONNECT = 0;       // 连接虚拟机
+        private const uint OP_START = 1;         // 启动 / 恢复（已保存 / 已暂停 / 已关闭）
+        private const uint OP_SAVE = 2;          // 保存虚拟机状态
+        private const uint OP_STOP = 3;          // 关闭虚拟机
+        private const uint OP_DISCARD = 4;       // 销毁保存的虚拟机
+        private const uint IDM_STOPALL = 0x0001;
+        private const uint IDM_SAVEALL = 0x0002;
+        private const uint IDM_RESTOREALL = 0x0003;
+        private const uint IDM_DISCARDALL = 0x0004;
+        private const uint IDM_CONNECTALL = 0x0005;
+        private const uint IDM_REFRESH = 0x0006;
+        private const uint IDM_AUTOSTART = 0x0007;
+        private const uint IDM_EXIT = 0x0008;
 
         private static readonly bool debugLog = string.Equals(
             Environment.GetEnvironmentVariable("HYPERV_TRAY_DEBUG"), "1", StringComparison.OrdinalIgnoreCase);
@@ -76,7 +126,6 @@ namespace HyperVTray
             Environment.GetFolderPath(Environment.SpecialFolder.Startup), "HyperV-Tray.lnk");
 
         private static NotifyIcon tray;
-        private static ContextMenuStrip trayMenu;
         private static AnchorWindow anchorWindow;
         private static Icon baseIcon;
         private static Icon greenIcon;
@@ -89,6 +138,8 @@ namespace HyperVTray
         private static ThreadingTimer uptimeTick;
         private static readonly List<UptimeEntry> uptimeEntries = new List<UptimeEntry>();
         private static DateTime menuOpenTime;
+        private static volatile bool inContextMenu;   // 防 TrackPopupMenu 模态循环期间托盘消息重入
+        private static volatile int menuGeneration;   // 菜单代际计数：关闭后使排队中的详情行刷新委托失效，避免对已销毁句柄操作
         private static readonly Dictionary<string, int> prevRun = new Dictionary<string, int>();
         private static volatile bool suppressNotify;
         private static volatile bool confirmOpen;
@@ -123,6 +174,13 @@ namespace HyperVTray
             catch { }
         }
 
+        private static void TryEnableDarkMode()
+        {
+            // SetPreferredAppMode 需在创建任何窗口前调用；Win10 1809 之前不存在该导出，失败则忽略
+            try { SetPreferredAppMode(1); }   // 1 = APPMODE_ALLOWDARK，让原生菜单/弹窗跟随系统深色
+            catch (Exception ex) { LogEx("DarkMode", ex); }
+        }
+
         [STAThread]
         private static void Main()
         {
@@ -137,6 +195,7 @@ namespace HyperVTray
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            TryEnableDarkMode();   // 必须在创建任何窗口之前调用，否则原生菜单/弹窗不跟随系统深色
 
             bool createdNew;
             mutex = new Mutex(true, @"Global\HyperV-Tray_SingleInstance", out createdNew);
@@ -156,14 +215,9 @@ namespace HyperVTray
             tray.Icon = baseIcon;
             tray.Text = "Hyper-V 监控";
             tray.Visible = true;
-            trayMenu = new ContextMenuStrip();
-            trayMenu.Renderer = new StatusRenderer();
-            trayMenu.Opening += (s, e) => RefreshMenu();
-            trayMenu.Opened += (s, e) => AdjustMenuBounds();
-            trayMenu.Closed += (s, e) => uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
             tray.MouseUp += (s, e) =>
             {
-                // 左右键均弹出菜单；显示前激活隐藏窗口，否则菜单失焦不自动关闭
+                // 左右键均弹出原生菜单；TrackPopupMenu 前先激活隐藏窗口，否则菜单无法正确消失
                 if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
                     ShowTrayMenu();
             };
@@ -270,39 +324,48 @@ namespace HyperVTray
 
         private static void ShowTrayMenu()
         {
+            // TrackPopupMenu 模态循环期间托盘消息仍会派发，防止重入导致嵌套菜单
+            if (inContextMenu) return;
+            inContextMenu = true;
+            int gen = ++menuGeneration;
+            IntPtr hmenu = IntPtr.Zero;
             try
             {
-                // 先激活隐藏窗口再显示菜单：ToolStripDropDown 依赖焦点实现失焦自动关闭，
-                // 托盘程序没有主窗口，直接 Show 会导致点击菜单外部无法关闭
+                List<VMInfo> vms = GetVms();
+                hmenu = BuildMenu(vms);
+                if (hmenu == IntPtr.Zero) return;
+
+                menuOpenTime = DateTime.Now;
+                bool hasRunning;
+                lock (uptimeEntries) hasRunning = uptimeEntries.Count > 0;
+                uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
+
+                // 先激活隐藏窗口再弹菜单：TrackPopupMenu 的模态循环依赖前台窗口才能正确获得/释放输入焦点
                 SetForegroundWindow(anchorWindow.Handle);
-                trayMenu.Show(Cursor.Position);
+                POINT pt;
+                GetCursorPos(out pt);
+                uint id = TrackPopupMenu(hmenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
+                    pt.X, pt.Y, 0, anchorWindow.Handle, IntPtr.Zero);
+                // 菜单消失 workaround：模态循环结束后补发一条 WM_NULL 让菜单正确收尾
                 PostMessage(anchorWindow.Handle, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+
+                HandleCommand(id, vms);
             }
             catch (Exception ex) { LogEx("ShowTrayMenu", ex); }
-        }
-
-        private static void RefreshMenu()
-        {
-            List<VMInfo> vms = GetVms();
-            bool hasRunning = RebuildMenu(vms);
-            menuOpenTime = DateTime.Now;
-            uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
-        }
-
-        private static void AdjustMenuBounds()
-        {
-            try
+            finally
             {
-                var menu = trayMenu;
-                var wa = Screen.FromPoint(menu.Location).WorkingArea;
-                int x = menu.Left, y = menu.Top;
-                if (menu.Right > wa.Right) x = wa.Right - menu.Width;
-                if (menu.Bottom > wa.Bottom) y = wa.Bottom - menu.Height;
-                if (x < wa.Left) x = wa.Left;
-                if (y < wa.Top) y = wa.Top;
-                if (x != menu.Left || y != menu.Top) menu.Location = new Point(x, y);
+                menuGeneration++;   // 使排队中的详情行刷新委托失效，避免对已销毁句柄 ModifyMenuW
+                uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
+                lock (uptimeEntries) uptimeEntries.Clear();
+                if (hmenu != IntPtr.Zero) DestroyMenu(hmenu);
+                inContextMenu = false;
             }
-            catch (Exception ex) { LogEx("AdjustMenuBounds", ex); }
+        }
+
+        private static string EscapeAmp(string text)
+        {
+            // 菜单文本中的 & 会被当作加速键前缀吞掉，转义为 && 以原样显示
+            return text.Replace("&", "&&");
         }
 
         private static void TickUptime()
@@ -315,6 +378,7 @@ namespace HyperVTray
 
                 var scope = GetScope();
                 long nowSec = (long)(DateTime.Now - menuOpenTime).TotalSeconds;
+                int gen = menuGeneration;   // 捕获打开本菜单时的代际，菜单关闭后不再更新已销毁句柄
 
                 var texts = new string[entries.Length];
                 for (int i = 0; i < entries.Length; i++)
@@ -342,8 +406,14 @@ namespace HyperVTray
                 {
                     try
                     {
+                        if (gen != menuGeneration) return;   // 菜单已关闭，句柄已销毁，丢弃本次刷新
                         for (int i = 0; i < entries.Length; i++)
-                            entries[i].Detail.Text = texts[i];
+                        {
+                            UptimeEntry e = entries[i];
+                            ModifyMenuW(e.SubMenu, e.DetailId,
+                                MF_BYCOMMAND | MF_STRING | MF_DISABLED | MF_GRAYED,
+                                (UIntPtr)e.DetailId, texts[i]);
+                        }
                     }
                     catch (Exception ex) { LogEx("TickUptime.UI", ex); }
                 }, null);
@@ -553,170 +623,181 @@ namespace HyperVTray
             }
         }
 
-        private static bool RebuildMenu(List<VMInfo> vms)
+        private static IntPtr BuildMenu(List<VMInfo> vms)
         {
-            var menu = trayMenu;
-            menu.Items.Clear();
-            lock (uptimeEntries) uptimeEntries.Clear();
+            IntPtr hmenu = CreatePopupMenu();
+            if (hmenu == IntPtr.Zero) return IntPtr.Zero;
 
-            bool hasRunning = false;
-            bool anySaved = false;
-            bool hvEnabled = IsHyperVServiceRunning();
-            var hvHeader = new ToolStripMenuItem(hvEnabled ? "已启用 Hyper-V 服务" : "未启用 Hyper-V 服务") { Enabled = false };
-            hvHeader.ForeColor = hvEnabled ? Color.Green : Color.Red;
-            menu.Items.Add(hvHeader);
-
-            menu.Items.Add(new ToolStripSeparator());
-
-            menu.Items.Add(new ToolStripMenuItem("虚拟机") { Enabled = false });
-
-            menu.Items.Add(new ToolStripSeparator());
-
-            if (vms == null)
+            try
             {
-                menu.Items.Add(new ToolStripMenuItem("(查询失败，请点“立即刷新”重试)") { Enabled = false });
-            }
-            else if (vms.Count == 0)
-            {
-                menu.Items.Add(new ToolStripMenuItem("(没有虚拟机)") { Enabled = false });
-            }
-            else
-            {
-                foreach (var v in vms)
+                lock (uptimeEntries) uptimeEntries.Clear();
+
+                bool hasRunning = false;
+                bool anySaved = false;
+                bool hvEnabled = IsHyperVServiceRunning();
+
+                AppendMenuW(hmenu, MF_STRING | MF_DISABLED | MF_GRAYED, UIntPtr.Zero,
+                    (hvEnabled ? "已启用" : "未启用") + " Hyper-V 服务");
+                AppendMenuW(hmenu, MF_SEPARATOR, UIntPtr.Zero, null);
+                AppendMenuW(hmenu, MF_STRING | MF_DISABLED | MF_GRAYED, UIntPtr.Zero, "虚拟机");
+                AppendMenuW(hmenu, MF_SEPARATOR, UIntPtr.Zero, null);
+
+                if (vms == null)
                 {
-                    string vmName = v.Name;
-                    string vmGuid = v.Guid;
-
-                    var vmItem = new ToolStripMenuItem(vmName + "  [" + StateText(v) + "]");
-
-                    if (v.Running)
+                    AppendMenuW(hmenu, MF_STRING | MF_DISABLED | MF_GRAYED, UIntPtr.Zero,
+                        "(查询失败，请点“立即刷新”重试)");
+                }
+                else if (vms.Count == 0)
+                {
+                    AppendMenuW(hmenu, MF_STRING | MF_DISABLED | MF_GRAYED, UIntPtr.Zero, "(没有虚拟机)");
+                }
+                else
+                {
+                    for (int i = 0; i < vms.Count; i++)
                     {
-                        var entry = new UptimeEntry();
-                        entry.Guid = v.Guid;
-                        entry.Detail = new ToolStripMenuItem { Enabled = false };
-                        entry.BaseSeconds = v.UpTimeSeconds;
-                        entry.AllocatedMB = v.MemoryLimitMB;
-                        entry.DynamicMemory = v.DynamicMemory;
-                        entry.Detail.Text = "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--")
-                            + " | " + MemInfo(v.MemoryUsedMB, v.MemoryLimitMB, v.DynamicMemory)
-                            + " | 已运行 " + FormatUptime(v.UpTimeSeconds);
-                        vmItem.DropDownItems.Add(entry.Detail);
-                        lock (uptimeEntries) uptimeEntries.Add(entry);
-                    }
+                        VMInfo v = vms[i];
+                        uint idmBase = IDM_FIRSTVM + (uint)i * VM_SLOT;
+                        string label = EscapeAmp(v.Name + "  [" + StateText(v) + "]");
 
-                    var connect = new ToolStripMenuItem("连接虚拟机");
-                    connect.Click += (s, e) => ConnectVm(vmName);
-                    vmItem.DropDownItems.Add(connect);
+                        IntPtr hsub = CreatePopupMenu();
+                        if (hsub == IntPtr.Zero) continue;
 
-                    if (v.Running)
-                    {
-                        hasRunning = true;
-                        var save = new ToolStripMenuItem("保存虚拟机状态");
-                        save.Click += (s, e) => StartThread(delegate { SaveVm(vmGuid); });
-                        vmItem.DropDownItems.Add(save);
-
-                        var stop = new ToolStripMenuItem("关闭虚拟机");
-                        stop.Click += (s, e) => StartThread(delegate { StopVm(vmGuid); });
-                        vmItem.DropDownItems.Add(stop);
-                    }
-                    else if (v.StateCode == 6)
-                    {
-                        anySaved = true;
-                        var restore = new ToolStripMenuItem("恢复虚拟机");
-                        restore.Click += (s, e) => StartThread(delegate { StartVm(vmGuid); });
-                        vmItem.DropDownItems.Add(restore);
-
-                        var discard = new ToolStripMenuItem("销毁保存的虚拟机");
-                        discard.Click += (s, e) =>
+                        if (v.Running)
                         {
-                            if (Confirm("确定要销毁「" + vmName + "」的保存状态吗？"))
-                                StartThread(delegate { DiscardSavedVm(vmGuid); });
-                        };
-                        vmItem.DropDownItems.Add(discard);
-                    }
-                    else if (IsPaused(v))
-                    {
-                        // 已暂停：只能恢复（请求回到运行态），不提供其他操作
-                        var resume = new ToolStripMenuItem("恢复虚拟机");
-                        resume.Click += (s, e) => StartThread(delegate { StartVm(vmGuid); });
-                        vmItem.DropDownItems.Add(resume);
-                    }
-                    else if (v.StateCode == 3)
-                    {
-                        var start = new ToolStripMenuItem("启动虚拟机");
-                        start.Click += (s, e) => StartThread(delegate { StartVm(vmGuid); });
-                        vmItem.DropDownItems.Add(start);
-                    }
-                    // 过渡状态（启动中/停止中/暂停中）及未知状态：仅提供连接，避免误操作
+                            var entry = new UptimeEntry();
+                            entry.Guid = v.Guid;
+                            entry.SubMenu = hsub;
+                            entry.DetailId = idmBase + IDM_DETAIL;
+                            entry.BaseSeconds = v.UpTimeSeconds;
+                            entry.AllocatedMB = v.MemoryLimitMB;
+                            entry.DynamicMemory = v.DynamicMemory;
+                            AppendMenuW(hsub, MF_STRING | MF_DISABLED | MF_GRAYED,
+                                (UIntPtr)entry.DetailId,
+                                "CPU " + (v.CpuLoad >= 0 ? v.CpuLoad + "%" : "--")
+                                + " | " + MemInfo(v.MemoryUsedMB, v.MemoryLimitMB, v.DynamicMemory)
+                                + " | 已运行 " + FormatUptime(v.UpTimeSeconds));
+                            lock (uptimeEntries) uptimeEntries.Add(entry);
+                            hasRunning = true;
+                        }
 
-                    menu.Items.Add(vmItem);
+                        AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_CONNECT), "连接虚拟机");
+
+                        if (v.Running)
+                        {
+                            AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_SAVE), "保存虚拟机状态");
+                            AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_STOP), "关闭虚拟机");
+                        }
+                        else if (v.StateCode == 6)
+                        {
+                            anySaved = true;
+                            AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_START), "恢复虚拟机");
+                            AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_DISCARD), "销毁保存的虚拟机");
+                        }
+                        else if (IsPaused(v))
+                        {
+                            // 已暂停：只能恢复（请求回到运行态），不提供其他操作
+                            AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_START), "恢复虚拟机");
+                        }
+                        else if (v.StateCode == 3)
+                        {
+                            AppendMenuW(hsub, MF_STRING, (UIntPtr)(idmBase + OP_START), "启动虚拟机");
+                        }
+                        // 过渡状态（启动中/停止中/暂停中）及未知状态：仅提供连接，避免误操作
+
+                        if (!AppendMenuW(hmenu, MF_POPUP, new UIntPtr((ulong)hsub.ToInt64()), label))
+                            DestroyMenu(hsub);
+                    }
+                }
+
+                AppendMenuW(hmenu, MF_SEPARATOR, UIntPtr.Zero, null);
+
+                AppendMenuW(hmenu, MF_STRING | (hasRunning ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_STOPALL, "关闭全部虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (hasRunning ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_SAVEALL, "保存全部虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (anySaved ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_RESTOREALL, "恢复所有保存的虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (anySaved ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_DISCARDALL, "销毁所有保存的虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (hasRunning ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_CONNECTALL, "连接所有运行中的虚拟机");
+
+                AppendMenuW(hmenu, MF_SEPARATOR, UIntPtr.Zero, null);
+
+                AppendMenuW(hmenu, MF_STRING, (UIntPtr)IDM_REFRESH, "立即刷新");
+                AppendMenuW(hmenu, MF_STRING | (File.Exists(StartupLnk) ? MF_CHECKED : 0),
+                    (UIntPtr)IDM_AUTOSTART, "开机自启");
+                AppendMenuW(hmenu, MF_STRING, (UIntPtr)IDM_EXIT, "退出");
+            }
+            catch (Exception ex)
+            {
+                LogEx("BuildMenu", ex);
+                lock (uptimeEntries) uptimeEntries.Clear();
+                DestroyMenu(hmenu);
+                return IntPtr.Zero;
+            }
+
+            return hmenu;
+        }
+
+        private static void HandleCommand(uint id, List<VMInfo> vms)
+        {
+            try
+            {
+                switch (id)
+                {
+                    case 0: return;   // 用户取消了菜单
+                    case IDM_EXIT:
+                        tray.Visible = false;
+                        tray.Dispose();
+                        Application.Exit();
+                        return;
+                    case IDM_REFRESH:
+                        UpdateStatus();
+                        return;
+                    case IDM_AUTOSTART:
+                        ToggleAutostart();
+                        return;
+                    case IDM_STOPALL:
+                        if (Confirm("确定要关闭所有虚拟机吗？")) StopAllVms();
+                        return;
+                    case IDM_SAVEALL:
+                        if (Confirm("确定要保存所有虚拟机吗？")) SaveAllVms();
+                        return;
+                    case IDM_RESTOREALL:
+                        RestoreAllSaved();
+                        return;
+                    case IDM_DISCARDALL:
+                        if (Confirm("确定要销毁所有保存的虚拟机吗？")) DiscardAllSaved();
+                        return;
+                    case IDM_CONNECTALL:
+                        ConnectAllRunning();
+                        return;
+                }
+
+                if (id >= IDM_FIRSTVM && vms != null)
+                {
+                    uint off = id - IDM_FIRSTVM;
+                    int index = (int)(off / VM_SLOT);
+                    uint op = off % VM_SLOT;
+                    if (index >= 0 && index < vms.Count)
+                    {
+                        VMInfo v = vms[index];
+                        switch (op)
+                        {
+                            case OP_CONNECT: ConnectVm(v.Name); break;
+                            case OP_START: StartThread(delegate { StartVm(v.Guid); }); break;
+                            case OP_SAVE: StartThread(delegate { SaveVm(v.Guid); }); break;
+                            case OP_STOP: StartThread(delegate { StopVm(v.Guid); }); break;
+                            case OP_DISCARD:
+                                if (Confirm("确定要销毁「" + v.Name + "」的保存状态吗？"))
+                                    StartThread(delegate { DiscardSavedVm(v.Guid); });
+                                break;
+                        }
+                    }
                 }
             }
-
-            menu.Items.Add(new ToolStripSeparator());
-
-            var stopAll = new ToolStripMenuItem("关闭全部虚拟机");
-            stopAll.Enabled = hasRunning;
-            stopAll.Click += (s, e) =>
-            {
-                if (Confirm("确定要关闭所有虚拟机吗？"))
-                    StopAllVms();
-            };
-            menu.Items.Add(stopAll);
-
-            var saveAll = new ToolStripMenuItem("保存全部虚拟机");
-            saveAll.Enabled = hasRunning;
-            saveAll.Click += (s, e) =>
-            {
-                if (Confirm("确定要保存所有虚拟机吗？"))
-                    SaveAllVms();
-            };
-            menu.Items.Add(saveAll);
-
-            var restoreAll = new ToolStripMenuItem("恢复所有保存的虚拟机");
-            restoreAll.Enabled = anySaved;
-            restoreAll.Click += (s, e) => RestoreAllSaved();
-            menu.Items.Add(restoreAll);
-
-            var discardAll = new ToolStripMenuItem("销毁所有保存的虚拟机");
-            discardAll.Enabled = anySaved;
-            discardAll.Click += (s, e) =>
-            {
-                if (Confirm("确定要销毁所有保存的虚拟机吗？"))
-                    DiscardAllSaved();
-            };
-            menu.Items.Add(discardAll);
-
-            var connectAll = new ToolStripMenuItem("连接所有运行中的虚拟机");
-            connectAll.Enabled = hasRunning;
-            connectAll.Click += (s, e) => ConnectAllRunning();
-            menu.Items.Add(connectAll);
-
-            menu.Items.Add(new ToolStripSeparator());
-
-            var refresh = new ToolStripMenuItem("立即刷新");
-            refresh.Click += (s, e) => UpdateStatus();
-            menu.Items.Add(refresh);
-
-            var auto = new ToolStripMenuItem("开机自启");
-            auto.Checked = File.Exists(StartupLnk);
-            auto.Click += (s, e) =>
-            {
-                ToggleAutostart();
-                auto.Checked = File.Exists(StartupLnk);
-            };
-            menu.Items.Add(auto);
-
-            var exit = new ToolStripMenuItem("退出");
-            exit.Click += (s, e) =>
-            {
-                tray.Visible = false;
-                tray.Dispose();
-                Application.Exit();
-            };
-            menu.Items.Add(exit);
-
-            return hasRunning;
+            catch (Exception ex) { LogEx("HandleCommand", ex); }
         }
 
         private static bool IsHyperVServiceRunning()
