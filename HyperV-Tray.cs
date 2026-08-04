@@ -523,7 +523,7 @@ namespace HyperVTray
             try
             {
                 var scope = GetScope();
-                var query = new ObjectQuery("SELECT Name, ElementName, EnabledState, TimeOfLastStateChange FROM Msvm_ComputerSystem");
+                var query = new ObjectQuery("SELECT Name, ElementName, EnabledState, TimeOfLastStateChange, OnTimeInMilliseconds FROM Msvm_ComputerSystem");
                 using (var searcher = new ManagementObjectSearcher(scope, query))
                 {
                     foreach (ManagementObject mo in searcher.Get())
@@ -538,7 +538,16 @@ namespace HyperVTray
                             v.Guid = id;
                             v.StateCode = Convert.ToInt32(mo["EnabledState"]);
                             v.Running = v.StateCode == 2;
-                            if (v.Running) v.UpTimeSeconds = ComputeUpTime(mo["TimeOfLastStateChange"]);
+                            if (v.Running)
+                            {
+                                // 优先用 OnTimeInMilliseconds：单位明确(毫秒)、语义是“上次开机/重置/恢复以来”且排除暂停时间；
+                                // 老系统无此属性时兜底用 TimeOfLastStateChange 差值（秒，语义为“状态变更时刻”，宿主睡眠/校时下可能虚增）
+                                object onTime = mo["OnTimeInMilliseconds"];
+                                if (onTime != null && Convert.ToInt64(onTime) > 0)
+                                    v.UpTimeSeconds = Convert.ToInt64(onTime) / 1000;
+                                else
+                                    v.UpTimeSeconds = ComputeUpTime(mo["TimeOfLastStateChange"]);
+                            }
                             if (!string.IsNullOrEmpty(v.Name)) list.Add(v);
                         }
                         catch (Exception ex) { LogEx("GetVms.Item", ex); }
@@ -579,8 +588,8 @@ namespace HyperVTray
         {
             try
             {
-                // 一次 Msvm_SummaryInformation 查询同时取 CPU、内存、运行时长，替代多次查询
-                var q = new ObjectQuery("SELECT ProcessorLoad, MemoryUsage, UpTime FROM Msvm_SummaryInformation WHERE Name='" + v.Guid + "'");
+                // 一次 Msvm_SummaryInformation 查询同时取 CPU、内存，替代多次查询
+                var q = new ObjectQuery("SELECT ProcessorLoad, MemoryUsage FROM Msvm_SummaryInformation WHERE Name='" + v.Guid + "'");
                 using (var s = new ManagementObjectSearcher(scope, q))
                 {
                     foreach (ManagementObject mo in s.Get())
@@ -589,8 +598,6 @@ namespace HyperVTray
                         if (load != null) v.CpuLoad = Convert.ToInt32(load);
                         object mem = mo["MemoryUsage"];
                         if (mem != null) v.MemoryUsedMB = Convert.ToInt64(mem);
-                        object up = mo["UpTime"];
-                        if (up != null && Convert.ToInt64(up) > 0) v.UpTimeSeconds = Convert.ToInt64(up);
                     }
                 }
 

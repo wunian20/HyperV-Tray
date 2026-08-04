@@ -44,7 +44,7 @@
 
 ## 原理
 
-使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。运行中虚拟机的 CPU / 内存 / 运行时长通过一次 `Msvm_SummaryInformation` 查询（`ProcessorLoad` / `MemoryUsage` / `UpTime`）批量获取，查询结果带 1.5 秒缓存，右键菜单即时弹出不卡顿。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现；保存(6)/恢复(2)/销毁(3)亦通过 `RequestStateChange` 实现。
+使用 `ManagementEventWatcher` 订阅 WMI 事件（`root\virtualization\v2` 命名空间的 `__InstanceModificationEvent` / `__InstanceCreationEvent` / `__InstanceDeletionEvent`，`TargetInstance ISA 'Msvm_ComputerSystem'`）。后台线程阻塞等待，虚拟机状态变化时由 WMI 推送通知，秒级更新托盘图标；空闲时进程零 CPU 占用。另设 60 秒兜底轮询避免事件订阅异常时漏报。运行中虚拟机的 CPU / 内存通过一次 `Msvm_SummaryInformation` 查询（`ProcessorLoad` / `MemoryUsage`）批量获取，运行时长取 `Msvm_ComputerSystem.OnTimeInMilliseconds`（毫秒、排除暂停时间，旧系统无此属性时兜底用 `TimeOfLastStateChange` 差值），查询结果带 1.5 秒缓存，托盘菜单即时弹出不卡顿。启动/关闭通过 `Msvm_ShutdownComponent.InitiateShutdown`（优雅关机）与 `Msvm_ComputerSystem.RequestStateChange`（启动/强制关闭）实现；保存(6)/恢复(2)/销毁(3)亦通过 `RequestStateChange` 实现。
 
 ## 构建
 
