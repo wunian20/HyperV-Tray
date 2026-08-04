@@ -55,10 +55,6 @@ namespace HyperVTray
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool AppendMenuW(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, string lpNewItem);
 
-        // MF_OWNERDRAW 时 lpNewItem 参数是 itemData 指针而非文本，需要 IntPtr 重载
-        [DllImport("user32.dll")]
-        private static extern bool AppendMenuW(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, IntPtr lpNewItem);
-
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool DestroyMenu(IntPtr hMenu);
 
@@ -77,24 +73,6 @@ namespace HyperVTray
         [DllImport("user32.dll")]
         private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("gdi32.dll")]
-        private static extern IntPtr CreateSolidBrush(uint crColor);
-
-        [DllImport("gdi32.dll")]
-        private static extern bool DeleteObject(IntPtr hObject);
-
-        [DllImport("gdi32.dll")]
-        private static extern int SetBkMode(IntPtr hdc, int iBkMode);
-
-        [DllImport("gdi32.dll")]
-        private static extern uint SetTextColor(IntPtr hdc, uint crColor);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        private static extern int DrawTextW(IntPtr hdc, string lpchText, int cchText, ref RECT lprc, uint dwDTFormat);
-
-        [DllImport("user32.dll")]
-        private static extern int FillRect(IntPtr hDC, ref RECT lprc, IntPtr hbr);
-
         [DllImport("user32.dll")]
         private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiAwarenessContext);
 
@@ -112,44 +90,9 @@ namespace HyperVTray
             public int Y;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct RECT
-        {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MEASUREITEMSTRUCT
-        {
-            public uint CtlType;
-            public uint CtlID;
-            public uint itemID;
-            public uint itemWidth;
-            public uint itemHeight;
-            public IntPtr itemData;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct DRAWITEMSTRUCT
-        {
-            public uint CtlType;
-            public uint CtlID;
-            public uint itemID;
-            public uint itemAction;
-            public uint itemState;
-            public IntPtr hwndItem;
-            public IntPtr hDC;
-            public RECT rcItem;
-            public IntPtr itemData;
-        }
-
         // 菜单项标志（WinUser.h MF_*）
         private const uint MF_STRING = 0x0000;
         private const uint MF_POPUP = 0x0010;
-        private const uint MF_OWNERDRAW = 0x0100;
         private const uint MF_SEPARATOR = 0x0800;
         private const uint MF_DISABLED = 0x0002;
         private const uint MF_GRAYED = 0x0001;
@@ -163,17 +106,6 @@ namespace HyperVTray
         private const uint TPM_RETURNCMD = 0x0100;
 
         private const uint WM_NULL = 0x0000;
-        private const uint WM_MEASUREITEM = 0x002C;
-        private const uint WM_DRAWITEM = 0x002B;
-
-        // owner-draw 绘制标志
-        private const uint ODS_SELECTED = 0x0001;
-        private const uint ODS_DISABLED = 0x0004;
-        private const int TRANSPARENT = 1;
-        private const uint DT_SINGLELINE = 0x0020;
-        private const uint DT_VCENTER = 0x0004;
-        private const uint DT_LEFT = 0x0000;
-        private const uint DT_NOPREFIX = 0x0800;
 
         // 菜单 ID 规划：仿照 HyperVTray 的 idmBase + i*16 + op 编码。
         // 全局命令用低位 ID（1..8，0 保留表示取消），VM 区从 0x0100 起每台占 16 槽，
@@ -195,6 +127,8 @@ namespace HyperVTray
         private const uint IDM_REFRESH = 0x0006;
         private const uint IDM_AUTOSTART = 0x0007;
         private const uint IDM_EXIT = 0x0008;
+        private const uint IDM_CONFIRM_YES = 0x0009;   // 确认子菜单：确认执行
+        private const uint IDM_CONFIRM_NO = 0x000A;     // 确认子菜单：取消
 
         private static readonly bool debugLog = string.Equals(
             Environment.GetEnvironmentVariable("HYPERV_TRAY_DEBUG"), "1", StringComparison.OrdinalIgnoreCase);
@@ -216,7 +150,6 @@ namespace HyperVTray
         private static DateTime menuOpenTime;
         private static volatile bool inContextMenu;   // 防 TrackPopupMenu 模态循环期间托盘消息重入
         private static volatile int menuGeneration;   // 菜单代际计数：关闭后使排队中的详情行刷新委托失效，避免对已销毁句柄操作
-        private static uint pendingBatchId;           // 待二次确认的破坏性批量操作 ID（0 = 无）；菜单重开时该项显示为红色
         private static readonly Dictionary<string, int> prevRun = new Dictionary<string, int>();
         private static volatile bool suppressNotify;
         private static volatile bool confirmOpen;
@@ -416,50 +349,40 @@ namespace HyperVTray
             IntPtr hmenu = IntPtr.Zero;
             try
             {
-                while (true)
+                ++menuGeneration;
+                List<VMInfo> vms = GetVms();
+                hmenu = BuildMenu(vms);
+                if (hmenu == IntPtr.Zero) return;
+
+                menuOpenTime = DateTime.Now;
+                bool hasRunning;
+                lock (uptimeEntries) hasRunning = uptimeEntries.Count > 0;
+                uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
+
+                // 先激活隐藏窗口再弹菜单：TrackPopupMenu 的模态循环依赖前台窗口才能正确获得/释放输入焦点
+                SetForegroundWindow(anchorWindow.Handle);
+                POINT pt;
+                GetCursorPos(out pt);
+                uint id = TrackPopupMenu(hmenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
+                    pt.X, pt.Y, 0, anchorWindow.Handle, IntPtr.Zero);
+                // 菜单消失 workaround：模态循环结束后补发一条 WM_NULL 让菜单正确收尾
+                PostMessage(anchorWindow.Handle, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+
+                // 破坏性批量操作：弹出原生确认子菜单，确认后才真正执行
+                if (IsBatchConfirm(id))
                 {
-                    ++menuGeneration;   // 代际递增：使上一轮菜单排队中的详情行刷新委托失效
-                    List<VMInfo> vms = GetVms();
-                    hmenu = BuildMenu(vms);
-                    if (hmenu == IntPtr.Zero) return;
-
-                    menuOpenTime = DateTime.Now;
-                    bool hasRunning;
-                    lock (uptimeEntries) hasRunning = uptimeEntries.Count > 0;
-                    uptimeTick.Change(hasRunning ? 0 : Timeout.Infinite, hasRunning ? 1000 : Timeout.Infinite);
-
-                    // 先激活隐藏窗口再弹菜单：TrackPopupMenu 的模态循环依赖前台窗口才能正确获得/释放输入焦点
-                    SetForegroundWindow(anchorWindow.Handle);
-                    POINT pt;
-                    GetCursorPos(out pt);
-                    uint id = TrackPopupMenu(hmenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
-                        pt.X, pt.Y, 0, anchorWindow.Handle, IntPtr.Zero);
-                    // 菜单消失 workaround：模态循环结束后补发一条 WM_NULL 让菜单正确收尾
-                    PostMessage(anchorWindow.Handle, WM_NULL, IntPtr.Zero, IntPtr.Zero);
-
+                    // 确认菜单模态期间无需刷新详情行：先停计时器并清空条目，避免对已关闭的不可见菜单做无用更新
                     uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
                     lock (uptimeEntries) uptimeEntries.Clear();
-                    DestroyMenu(hmenu);
-                    hmenu = IntPtr.Zero;
-
-                    // 破坏性批量操作的两步确认：第一次点击 -> 记录 pending 并原地重开菜单（该项变红）；
-                    // 再点一次同一项才执行；点其他项/取消则清除 pending
-                    if (IsBatchConfirm(id) && id != pendingBatchId)
-                    {
-                        pendingBatchId = id;
-                        continue;
-                    }
-
-                    uint execId = id;
-                    pendingBatchId = 0;
-                    HandleCommand(execId, vms);
-                    return;
+                    if (!ConfirmBatchAction(id))
+                        return;   // 用户取消确认，不执行
                 }
+
+                HandleCommand(id, vms);
             }
             catch (Exception ex) { LogEx("ShowTrayMenu", ex); }
             finally
             {
-                pendingBatchId = 0;
                 menuGeneration++;   // 使排队中的详情行刷新委托失效，避免对已销毁句柄 ModifyMenuW
                 uptimeTick.Change(Timeout.Infinite, Timeout.Infinite);
                 lock (uptimeEntries) uptimeEntries.Clear();
@@ -474,50 +397,30 @@ namespace HyperVTray
             return text.Replace("&", "&&");
         }
 
-        // 追加破坏性批量菜单项：待二次确认时改用 owner-draw 渲染红色背景
-        private static void AppendBatchItem(IntPtr hmenu, uint id, uint flags, string text)
+        // 破坏性批量操作的原生确认子菜单：提示行 + 确认执行/取消；返回 true 表示用户确认执行
+        private static bool ConfirmBatchAction(uint id)
         {
-            if (id == pendingBatchId)
-                AppendMenuW(hmenu, MF_OWNERDRAW | flags, (UIntPtr)id, new IntPtr((int)id));
-            else
-                AppendMenuW(hmenu, MF_STRING | flags, (UIntPtr)id, text);
-        }
-
-        // 待确认批量项的自绘：红色背景 + 白字；鼠标悬停（选中态）时用更亮的红
-        private static void DrawRedItem(IntPtr lParam)
-        {
-            DRAWITEMSTRUCT dis = (DRAWITEMSTRUCT)Marshal.PtrToStructure(lParam, typeof(DRAWITEMSTRUCT));
-            string text = BatchItemText((uint)dis.itemData);
-            bool selected = (dis.itemState & ODS_SELECTED) != 0;
-            bool disabled = (dis.itemState & ODS_DISABLED) != 0;
-
-            // COLORREF 字节序为 0x00BBGGRR；禁用时画灰色，避免误导（点击只会取消确认）
-            uint bg = disabled ? 0x00808080u : (selected ? 0x006060FFu : 0x003838D0u);
-            uint fg = disabled ? 0x00C8C8C8u : 0x00FFFFFFu;
-            IntPtr brush = CreateSolidBrush(bg);
+            IntPtr hmenu = CreatePopupMenu();
+            if (hmenu == IntPtr.Zero) return false;
             try
             {
-                FillRect(dis.hDC, ref dis.rcItem, brush);
+                AppendMenuW(hmenu, MF_STRING | MF_DISABLED | MF_GRAYED, UIntPtr.Zero,
+                    "确认" + BatchItemText(id) + "？");
+                AppendMenuW(hmenu, MF_SEPARATOR, UIntPtr.Zero, null);
+                // “取消”在前：破坏性操作下回车默认落到取消，避免误触确认
+                AppendMenuW(hmenu, MF_STRING, (UIntPtr)IDM_CONFIRM_NO, "取消");
+                AppendMenuW(hmenu, MF_STRING, (UIntPtr)IDM_CONFIRM_YES, "确认执行");
+
+                // 与主菜单同样的弹出协议：前台窗口 + TrackPopupMenu + WM_NULL 收尾
+                SetForegroundWindow(anchorWindow.Handle);
+                POINT pt;
+                GetCursorPos(out pt);
+                uint result = TrackPopupMenu(hmenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
+                    pt.X, pt.Y, 0, anchorWindow.Handle, IntPtr.Zero);
+                PostMessage(anchorWindow.Handle, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                return result == IDM_CONFIRM_YES;
             }
-            finally { DeleteObject(brush); }
-
-            SetBkMode(dis.hDC, TRANSPARENT);
-            SetTextColor(dis.hDC, fg);
-            RECT rc = dis.rcItem;
-            rc.Left += 12;
-            rc.Right -= 4;
-            DrawTextW(dis.hDC, text, -1, ref rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
-        }
-
-        // owner-draw 项的尺寸：文本宽度 + 边距，高度对齐系统菜单项
-        private static void MeasureRedItem(IntPtr lParam)
-        {
-            MEASUREITEMSTRUCT mis = (MEASUREITEMSTRUCT)Marshal.PtrToStructure(lParam, typeof(MEASUREITEMSTRUCT));
-            string text = BatchItemText((uint)mis.itemData);
-            Size sz = TextRenderer.MeasureText(text, SystemFonts.MenuFont);
-            mis.itemWidth = (uint)(sz.Width + 24);
-            mis.itemHeight = (uint)(sz.Height + 8);
-            Marshal.StructureToPtr(mis, lParam, false);
+            finally { DestroyMenu(hmenu); }
         }
 
         private static string BatchItemText(uint id)
@@ -897,11 +800,14 @@ namespace HyperVTray
 
                 AppendMenuW(hmenu, MF_SEPARATOR, UIntPtr.Zero, null);
 
-                AppendBatchItem(hmenu, IDM_STOPALL, hasRunning ? 0 : MF_DISABLED | MF_GRAYED, "关闭全部虚拟机");
-                AppendBatchItem(hmenu, IDM_SAVEALL, hasRunning ? 0 : MF_DISABLED | MF_GRAYED, "保存全部虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (hasRunning ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_STOPALL, "关闭全部虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (hasRunning ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_SAVEALL, "保存全部虚拟机");
                 AppendMenuW(hmenu, MF_STRING | (anySaved ? 0 : MF_DISABLED | MF_GRAYED),
                     (UIntPtr)IDM_RESTOREALL, "恢复所有保存的虚拟机");
-                AppendBatchItem(hmenu, IDM_DISCARDALL, anySaved ? 0 : MF_DISABLED | MF_GRAYED, "销毁所有保存的虚拟机");
+                AppendMenuW(hmenu, MF_STRING | (anySaved ? 0 : MF_DISABLED | MF_GRAYED),
+                    (UIntPtr)IDM_DISCARDALL, "销毁所有保存的虚拟机");
                 AppendMenuW(hmenu, MF_STRING | (hasRunning ? 0 : MF_DISABLED | MF_GRAYED),
                     (UIntPtr)IDM_CONNECTALL, "连接所有运行中的虚拟机");
 
@@ -946,6 +852,7 @@ namespace HyperVTray
                         StopAllVms();
                         return;
                     case IDM_SAVEALL:
+                        // 两步确认已在 ShowTrayMenu 菜单层完成，这里直接执行
                         SaveAllVms();
                         return;
                     case IDM_RESTOREALL:
@@ -1426,22 +1333,9 @@ namespace HyperVTray
             catch (Exception ex) { LogEx("GetStateCode", ex); return -1; }
         }
 
-        // 用于激活菜单与接收 owner-draw 自绘消息的隐藏窗口
+        // 用于激活菜单的隐藏窗口（仅需句柄，无需处理消息）
         private sealed class AnchorWindow : NativeWindow
         {
-            protected override void WndProc(ref Message m)
-            {
-                switch (m.Msg)
-                {
-                    case (int)WM_MEASUREITEM:
-                        MeasureRedItem(m.LParam);
-                        return;
-                    case (int)WM_DRAWITEM:
-                        DrawRedItem(m.LParam);
-                        return;
-                }
-                base.WndProc(ref m);
-            }
         }
     }
 }
