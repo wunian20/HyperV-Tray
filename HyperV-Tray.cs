@@ -368,6 +368,7 @@ namespace HyperVTray
 
         private static void BlinkTick(object sender, EventArgs e)
         {
+            if (!blinking) return;   // StopBlink 后已入队的 WM_TIMER 仍可能触发一次，直接忽略
             blinkGreen = !blinkGreen;
             tray.Icon = (blinkGreen ? greenIcon : yellowIcon) ?? baseIcon ?? SystemIcons.Application;
         }
