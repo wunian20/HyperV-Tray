@@ -142,6 +142,9 @@ namespace HyperVTray
         private static Icon yellowIcon;
         private static Icon redIcon;
         private static FormsTimer refresh;
+        private static FormsTimer blinkTimer;         // 混合状态（运行+保存）时绿↔黄交替闪烁
+        private static bool blinking;                 // 当前是否处于闪烁中
+        private static bool blinkGreen;               // 闪烁相位：true=绿，false=黄
         private static ThreadingTimer debounce;
         private static SynchronizationContext sync;
         private static Mutex mutex;
@@ -260,6 +263,9 @@ namespace HyperVTray
             refresh.Tick += (s, e) => UpdateStatus();
             refresh.Start();
 
+            blinkTimer = new FormsTimer { Interval = 800 };
+            blinkTimer.Tick += (s, e) => BlinkTick(s, e);
+
             debounce = new ThreadingTimer(delegate { PostUpdate(); }, null, Timeout.Infinite, Timeout.Infinite);
 
             new Thread(WatchLoop) { IsBackground = true }.Start();
@@ -308,6 +314,7 @@ namespace HyperVTray
             if (vms == null)
             {
                 // WMI 查询失败：红色图标 + 明确提示，避免被误认为“没有虚拟机”
+                StopBlink();
                 tray.Icon = redIcon != null ? redIcon : baseIcon;
                 tray.Text = "Hyper-V 监控（查询失败）";
                 tray.Visible = true;
@@ -315,17 +322,18 @@ namespace HyperVTray
             }
 
             var running = new List<VMInfo>();
-            bool anySaved = false;
+            int savedCount = 0;
             foreach (var v in vms)
             {
                 if (v.Running) running.Add(v);
-                if (v.StateCode == 6) anySaved = true;
+                if (v.StateCode == 6) savedCount++;
             }
 
-            if (!IsHyperVServiceRunning()) tray.Icon = redIcon != null ? redIcon : baseIcon;
-            else if (running.Count > 0 && greenIcon != null) tray.Icon = greenIcon;
-            else if (anySaved && yellowIcon != null) tray.Icon = yellowIcon;
-            else tray.Icon = baseIcon;
+            if (!IsHyperVServiceRunning()) { StopBlink(); tray.Icon = redIcon != null ? redIcon : baseIcon; }
+            else if (running.Count > 0 && savedCount > 0) { StartBlink(); }   // 运行+保存混合：绿↔黄交替闪烁提醒
+            else if (running.Count > 0 && greenIcon != null) { StopBlink(); tray.Icon = greenIcon; }
+            else if (savedCount > 0 && yellowIcon != null) { StopBlink(); tray.Icon = yellowIcon; }
+            else { StopBlink(); tray.Icon = baseIcon; }
             tray.Visible = true;
             if (running.Count > 0)
             {
@@ -339,6 +347,29 @@ namespace HyperVTray
             }
 
             NotifyTransitions(vms);
+        }
+
+        // ---- 混合状态（运行+保存）的绿↔黄交替闪烁 ----
+        private static void StartBlink()
+        {
+            if (blinking) return;
+            blinking = true;
+            blinkGreen = true;
+            tray.Icon = greenIcon ?? yellowIcon ?? baseIcon ?? SystemIcons.Application;
+            blinkTimer.Start();
+        }
+
+        private static void StopBlink()
+        {
+            if (!blinking) return;
+            blinking = false;
+            blinkTimer.Stop();
+        }
+
+        private static void BlinkTick(object sender, EventArgs e)
+        {
+            blinkGreen = !blinkGreen;
+            tray.Icon = (blinkGreen ? greenIcon : yellowIcon) ?? baseIcon ?? SystemIcons.Application;
         }
 
         private static void ShowTrayMenu()
