@@ -709,7 +709,10 @@ namespace HyperVTray
 
         private static string MemInfo(long used, long max, bool dynamic)
         {
-            return "已使用 " + FmtMem(used) + " / " + (dynamic ? "最大" : "分配") + " " + FmtMem(max);
+            // 静态内存：Hyper-V 启动即预留全部，MemoryUsage 恒等于分配值、无实时语义，
+            // 显示“已使用”会误导（guest 实际占用由 Hyper-V 不提供），故只显示分配值
+            if (!dynamic) return "已分配 " + FmtMem(max) + "（静态）";
+            return "已使用 " + FmtMem(used) + " / 最大 " + FmtMem(max);
         }
 
         private static bool IsPaused(VMInfo v)
